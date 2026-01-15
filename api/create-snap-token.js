@@ -94,7 +94,7 @@ module.exports = async (req, res) => {
           address: String(order.address || "").slice(0, 200),
         },
       },
-      enabled_payments: ["qris"],
+      enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"],
     };
 
     const snapToken = await snap.createTransactionToken(parameter);
