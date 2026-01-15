@@ -114,7 +114,10 @@ module.exports = async (req, res) => {
 
     return json(res, 200, { snapToken });
   } catch (e) {
-    console.error(e);
-    return json(res, 500, { error: "Server error", detail: String(e.message || e) });
+    console.error("ERROR FULL:", e);
+
+    const detail = e?.ApiResponse?.error_messages || e?.message || String(e);
+
+    return json(res, 500, { error: "Server error", detail });
   }
 };
