@@ -57,6 +57,22 @@ module.exports = async (req, res) => {
     const order = snapOrder.data() || {};
     if (order.buyerUid !== uid) return json(res, 403, { error: "Not your order" });
 
+    const currentStatus = String(order.status || "PENDING_PAYMENT");
+
+    // Kalau sudah final, jangan pernah ditimpa lagi
+    if (currentStatus === "PAID") {
+      return json(res, 409, { error: "Order already PAID" });
+    }
+    if (currentStatus === "CANCELLED" || currentStatus === "REFUNDED") {
+      return json(res, 409, { error: `Order already ${currentStatus}` });
+    }
+
+    // Kalau token sudah ada, pakai token lama (idempotent)
+    const existingToken = order?.payment?.snapToken;
+    if (currentStatus === "PENDING_PAYMENT" && existingToken) {
+      return json(res, 200, { snapToken: existingToken, reused: true });
+    }
+
     const total = Number(order.total || 0);
     if (total <= 0) return json(res, 400, { error: "Invalid total" });
 
@@ -102,7 +118,6 @@ module.exports = async (req, res) => {
     // 5) Simpan ke Firestore
     await orderRef.set(
       {
-        status: "PENDING_PAYMENT",
         payment: {
           provider: "MIDTRANS",
           snapToken,
