@@ -118,7 +118,7 @@ module.exports = async (req, res) => {
     const parameter = {
       transaction_details: {
         order_id: orderId,
-        gross_amount: grossAmount, // Menggunakan grossAmount yang sudah dihitung
+        gross_amount: calculatedGrossAmount, // Menggunakan grossAmount yang sudah dihitung
       },
       item_details: item_details,
       customer_details: {
