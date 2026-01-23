@@ -99,6 +99,9 @@ module.exports = async (req, res) => {
       const order = orderSnap.data() || {};
       const productId = String(order.productId || "");
       const qty = Number(order.quantity || 0);
+      const ongkir = Number(order.ongkir || 0); // Ambil ongkir dari data order
+      const biayaAdmin = 2000; // Misalnya biaya admin tetap, bisa disesuaikan
+      const total = Number(order.total || 0); // Total produk (harga x quantity)
 
       // 1) Update status + payment raw notification
       t.set(
@@ -114,7 +117,7 @@ module.exports = async (req, res) => {
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
         },
-        { merge: true }
+        { merge: true },
       );
 
       // Kalau order tidak punya product/qty, stop
@@ -153,7 +156,7 @@ module.exports = async (req, res) => {
               deductedAt: admin.firestore.FieldValue.serverTimestamp(),
             },
           },
-          { merge: true }
+          { merge: true },
         );
 
         return;
@@ -176,11 +179,22 @@ module.exports = async (req, res) => {
               releasedAt: admin.firestore.FieldValue.serverTimestamp(),
             },
           },
-          { merge: true }
+          { merge: true },
         );
       }
 
-      // Kalau newStatus = PENDING_PAYMENT -> tidak melakukan apa-apa (karena reserve sudah dilakukan di Android)
+      // Menambahkan ongkir dan biaya admin ke gross_amount
+      const finalGrossAmount = total + ongkir + biayaAdmin;
+
+      // Update total pembayaran di order
+      t.set(
+        orderRef,
+        {
+          totalPembayaran: finalGrossAmount,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
     });
 
     return json(res, 200, { ok: true, status: newStatus });
