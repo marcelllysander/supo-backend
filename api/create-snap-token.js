@@ -92,6 +92,11 @@ module.exports = async (req, res) => {
     console.log("Admin Fee:", biayaAdmin);
     console.log("Calculated Gross Amount:", calculatedGrossAmount);
 
+    // Cek apakah hasil perhitungan benar
+    if (isNaN(calculatedGrossAmount)) {
+      return json(res, 400, { error: "Invalid total gross amount calculation" });
+    }
+
     // 5) Midtrans Snap
     const isProduction = String(process.env.MIDTRANS_IS_PRODUCTION) === "true";
     const serverKey = process.env.MIDTRANS_SERVER_KEY;
@@ -104,7 +109,6 @@ module.exports = async (req, res) => {
       clientKey: clientKey,
     });
 
-    // Gunakan calculatedGrossAmount di sini untuk memastikan kesesuaian
     const parameter = {
       transaction_details: {
         order_id: orderId,
