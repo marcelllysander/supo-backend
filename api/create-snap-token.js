@@ -91,20 +91,29 @@ module.exports = async (req, res) => {
       clientKey: clientKey,
     });
 
+    // Hitung total dari item_details dan set `gross_amount`
+    let itemTotal = 0;
+    const item_details = [
+      {
+        id: order.productId || "item", // Pastikan ada fallback untuk id
+        price: Number(order.price || total), // Fallback ke total jika price kosong
+        quantity: Number(order.quantity || 1), // Fallback ke 1 jika quantity kosong
+        name: String(order.productName || "Produk").slice(0, 50), // Fallback ke "Produk"
+      },
+    ];
+
+    // Total item_details
+    item_details.forEach((item) => {
+      itemTotal += item.price * item.quantity; // Harga * Quantity
+    });
+
     // Parameter untuk Midtrans
     const parameter = {
       transaction_details: {
         order_id: orderId,
-        gross_amount: total + ongkir + biayaAdmin, // Menambahkan ongkir dan biaya admin
+        gross_amount: itemTotal + ongkir + biayaAdmin, // Menambahkan ongkir dan biaya admin
       },
-      item_details: [
-        {
-          id: order.productId || "item", // Pastikan ada fallback untuk id
-          price: Number(order.price || total), // Fallback ke total jika price kosong
-          quantity: Number(order.quantity || 1), // Fallback ke 1 jika quantity kosong
-          name: String(order.productName || "Produk").slice(0, 50), // Fallback ke "Produk"
-        },
-      ],
+      item_details: item_details,
       customer_details: {
         first_name: String(order.receiverName || "Customer").slice(0, 50),
         phone: String(order.receiverPhone || ""),
@@ -117,16 +126,8 @@ module.exports = async (req, res) => {
       enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"], // Pastikan metode pembayaran aktif
     };
 
-    // Hitung total dari item_details dan set `gross_amount`
-    let totalAmount = 0;
-    parameter.item_details.forEach((item) => {
-      totalAmount += item.price * item.quantity; // Harga * Quantity
-    });
-
-    // Set gross_amount dengan total yang dihitung
-    parameter.transaction_details.gross_amount = totalAmount + ongkir + biayaAdmin;
-
-    console.log("Gross Amount:", totalAmount + ongkir + biayaAdmin); // Log untuk verifikasi
+    // Pastikan gross_amount dihitung dengan benar
+    console.log("Gross Amount (Total):", itemTotal + ongkir + biayaAdmin); // Log untuk verifikasi
 
     // Mengirim permintaan ke Midtrans untuk membuat Snap Token
     try {
