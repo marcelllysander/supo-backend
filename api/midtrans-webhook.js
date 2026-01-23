@@ -99,8 +99,8 @@ module.exports = async (req, res) => {
       const order = orderSnap.data() || {};
       const productId = String(order.productId || "");
       const qty = Number(order.quantity || 0);
-      const ongkir = Number(order.ongkir || 0); // Ambil ongkir dari data order
-      const biayaAdmin = 2000; // Misalnya biaya admin tetap, bisa disesuaikan
+      const ongkir = Number(order.shipping || 0); // Ongkir dari order
+      const biayaAdmin = 2000; // Biaya admin
       const total = Number(order.total || 0); // Total produk (harga x quantity)
 
       // 1) Update status + payment raw notification
@@ -120,71 +120,8 @@ module.exports = async (req, res) => {
         { merge: true },
       );
 
-      // Kalau order tidak punya product/qty, stop
-      if (!productId || qty <= 0) return;
-
-      const productRef = db.collection("products").doc(productId);
-      const productSnap = await t.get(productRef);
-      if (!productSnap.exists) return;
-
-      const product = productSnap.data() || {};
-      const stock = Number(product.stock || 0);
-      const reserved = Number(product.reserved || 0);
-
-      const stockState = order.stock || {};
-      const deducted = !!stockState.deducted;
-      const reservedReleased = !!stockState.reservedReleased;
-
-      // ===== CASE A: PAID -> potong stock + lepas reserved (HANYA SEKALI) =====
-      if (newStatus === "PAID" && !deducted) {
-        const newStock = stock - qty;
-        const newReserved = reserved - qty;
-
-        t.update(productRef, {
-          stock: newStock < 0 ? 0 : newStock,
-          reserved: newReserved < 0 ? 0 : newReserved,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        t.set(
-          orderRef,
-          {
-            stock: {
-              reservedApplied: true,
-              reservedReleased: true,
-              deducted: true,
-              deductedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-          },
-          { merge: true },
-        );
-
-        return;
-      }
-
-      // ===== CASE B: CANCELLED / REFUNDED -> release reserved (HANYA SEKALI) =====
-      if ((newStatus === "CANCELLED" || newStatus === "REFUNDED") && !reservedReleased) {
-        const newReserved = reserved - qty;
-
-        t.update(productRef, {
-          reserved: newReserved < 0 ? 0 : newReserved,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        t.set(
-          orderRef,
-          {
-            stock: {
-              reservedReleased: true,
-              releasedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-          },
-          { merge: true },
-        );
-      }
-
       // Menambahkan ongkir dan biaya admin ke gross_amount
-      const finalGrossAmount = Number(grossAmount) + Number(order.ongkir || 0) + 2000; // 2000 adalah biaya admin
+      const finalGrossAmount = Number(grossAmount) + ongkir + biayaAdmin;
 
       // Update total pembayaran di order
       t.set(
