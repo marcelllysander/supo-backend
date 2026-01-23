@@ -86,9 +86,16 @@ module.exports = async (req, res) => {
     console.log("Item Total from Item Details:", itemTotal);
     console.log("Shipping Cost:", order.shipping || 0);
     console.log("Admin Fee:", order.adminFee || 0);
+    console.log("Item Total (Sum of item details):", itemTotal); // Total harga barang saja
+    console.log("Gross Amount without Shipping/Admin:", itemTotal); // Pastikan ini sesuai
 
     // Kirimkan gross_amount yang hanya berdasarkan item details
     const calculatedGrossAmount = itemTotal;
+    console.log("Gross Amount Sent to Midtrans (Without Shipping/Admin):", calculatedGrossAmount);
+
+    console.log("Item Total:", itemTotal);
+    console.log("Shipping Cost:", ongkir);
+    console.log("Admin Fee:", biayaAdmin);
 
     // Cek apakah hasil perhitungan benar
     if (isNaN(calculatedGrossAmount)) {
