@@ -92,7 +92,7 @@ module.exports = async (req, res) => {
     const parameter = {
       transaction_details: {
         order_id: orderId,
-        gross_amount: total,
+        gross_amount: 0, // Akan dihitung berdasarkan item_details
       },
       item_details: [
         {
@@ -113,6 +113,17 @@ module.exports = async (req, res) => {
       },
       enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"], // Pastikan metode pembayaran aktif
     };
+
+    // Hitung total dari item_details dan set `gross_amount`
+    let totalAmount = 0;
+    parameter.item_details.forEach((item) => {
+      totalAmount += item.price * item.quantity; // Harga * Quantity
+    });
+
+    // Set gross_amount dengan total yang dihitung
+    parameter.transaction_details.gross_amount = totalAmount;
+
+    console.log("Gross Amount:", totalAmount); // Log untuk verifikasi
 
     // Mengirim permintaan ke Midtrans untuk membuat Snap Token
     try {
