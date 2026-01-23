@@ -69,6 +69,11 @@ module.exports = async (req, res) => {
 
     // 4) Hitung item_details dan total gross_amount
     let itemTotal = 0;
+
+    // Mendeklarasikan ongkir dan biaya admin terlebih dahulu
+    const ongkir = Number(order.shipping || 0); // Ongkir dari order
+    const biayaAdmin = Number(order.adminFee || 0); // Biaya admin dari order
+
     const item_details = [
       {
         id: order.productId || "item",
@@ -90,12 +95,12 @@ module.exports = async (req, res) => {
       },
     ];
 
-    // Menghitung gross_amount berdasarkan item details dan menambahkan ongkir & biaya admin
-    const ongkir = Number(order.shipping || 0); // Ongkir dari order
-    const biayaAdmin = Number(order.adminFee || 0); // Biaya admin dari order
+    item_details.forEach((item) => {
+      itemTotal += item.price * item.quantity; // Harga * Quantity
+    });
 
-    // Menghitung gross_amount hanya berdasarkan item_details dan biaya lainnya
-    const calculatedGrossAmount = item_details.reduce((total, item) => total + item.price * item.quantity, 0);
+    // Menghitung gross_amount berdasarkan item_details dan menambahkan ongkir & biaya admin
+    const calculatedGrossAmount = itemTotal;
     console.log("Calculated Gross Amount with Shipping/Admin:", calculatedGrossAmount); // Pastikan jumlahnya sesuai
     console.log("Item Total from Item Details:", itemTotal);
     console.log("Shipping Cost:", ongkir);
@@ -118,7 +123,6 @@ module.exports = async (req, res) => {
       clientKey: clientKey,
     });
 
-    // Kirimkan gross_amount yang sudah dihitung
     const parameter = {
       transaction_details: {
         order_id: orderId,
