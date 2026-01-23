@@ -67,50 +67,38 @@ module.exports = async (req, res) => {
       return json(res, 409, { error: `Order already ${currentStatus}` });
     }
 
-    // Kalau token sudah ada, pakai token lama (idempotent)
-    const existingToken = order?.payment?.snapToken;
-    if (currentStatus === "PENDING_PAYMENT" && existingToken) {
-      return json(res, 200, { snapToken: existingToken, reused: true });
-    }
+    // 4) Hitung item_details dan total gross_amount
+    let itemTotal = 0;
+    const item_details = [
+      {
+        id: order.productId || "item",
+        price: Number(order.price || total),
+        quantity: Number(order.quantity || 1),
+        name: String(order.productName || "Produk").slice(0, 50),
+      },
+    ];
 
-    const total = Number(order.total || 0);
-    const ongkir = Number(order.shipping || 0); // Ongkir sudah ada di Firestore
-    const biayaAdmin = 2000; // Biaya admin
+    item_details.forEach((item) => {
+      itemTotal += item.price * item.quantity; // Harga * Quantity
+    });
 
-    if (total <= 0) return json(res, 400, { error: "Invalid total" });
+    const ongkir = Number(order.shipping || 0); // Ongkir dari order
+    const biayaAdmin = Number(order.adminFee || 0); // Biaya admin dari order
 
-    // 4) Midtrans Snap
+    const grossAmount = itemTotal + ongkir + biayaAdmin; // Pastikan ini dihitung dengan benar
+
+    // 5) Midtrans Snap
     const isProduction = String(process.env.MIDTRANS_IS_PRODUCTION) === "true";
     const serverKey = process.env.MIDTRANS_SERVER_KEY;
     const clientKey = process.env.MIDTRANS_CLIENT_KEY;
     if (!serverKey || !clientKey) return json(res, 500, { error: "Midtrans env missing" });
 
     const snap = new midtransClient.Snap({
-      isProduction: isProduction, // Pastikan sudah benar
+      isProduction: isProduction,
       serverKey: serverKey,
       clientKey: clientKey,
     });
 
-    // Hitung total dari item_details dan set `gross_amount`
-    let itemTotal = 0;
-    const item_details = [
-      {
-        id: order.productId || "item", // Pastikan ada fallback untuk id
-        price: Number(order.price || total), // Fallback ke total jika price kosong
-        quantity: Number(order.quantity || 1), // Fallback ke 1 jika quantity kosong
-        name: String(order.productName || "Produk").slice(0, 50), // Fallback ke "Produk"
-      },
-    ];
-
-    // Total item_details
-    item_details.forEach((item) => {
-      itemTotal += item.price * item.quantity; // Harga * Quantity
-    });
-
-    // Pastikan gross_amount dihitung dengan benar
-    const grossAmount = itemTotal + ongkir + biayaAdmin;
-
-    // Parameter untuk Midtrans
     const parameter = {
       transaction_details: {
         order_id: orderId,
@@ -126,13 +114,11 @@ module.exports = async (req, res) => {
           address: String(order.address || "").slice(0, 200),
         },
       },
-      enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"], // Pastikan metode pembayaran aktif
+      enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"],
     };
 
-    // Pastikan gross_amount dihitung dengan benar
     console.log("Gross Amount (Total):", grossAmount); // Log untuk verifikasi
 
-    // Mengirim permintaan ke Midtrans untuk membuat Snap Token
     try {
       const snapToken = await snap.createTransactionToken(parameter);
       // Simpan snap token ke Firestore
