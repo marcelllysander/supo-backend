@@ -122,6 +122,8 @@ module.exports = async (req, res) => {
 
       // Menambahkan ongkir dan biaya admin ke gross_amount
       const finalGrossAmount = Number(grossAmount) + ongkir + biayaAdmin;
+      console.log("Received Webhook Data:", JSON.stringify(body, null, 2));
+      console.log("Gross Amount Received from Midtrans:", grossAmount);
 
       // Update total pembayaran di order
       t.set(

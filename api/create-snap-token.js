@@ -91,6 +91,8 @@ module.exports = async (req, res) => {
     console.log("Shipping Cost:", ongkir);
     console.log("Admin Fee:", biayaAdmin);
     console.log("Calculated Gross Amount:", calculatedGrossAmount);
+    console.log("Item Details:", JSON.stringify(item_details, null, 2));
+    console.log("Gross Amount Sent to Midtrans:", calculatedGrossAmount);
 
     // Cek apakah hasil perhitungan benar
     if (isNaN(calculatedGrossAmount)) {
