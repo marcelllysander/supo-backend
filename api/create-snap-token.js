@@ -86,10 +86,12 @@ module.exports = async (req, res) => {
     const biayaAdmin = Number(order.adminFee || 0); // Biaya admin dari order
 
     const calculatedGrossAmount = itemTotal + ongkir + biayaAdmin; // Pastikan ini dihitung dengan benar
-    console.log("Item Total:", itemTotal); // Log untuk memeriksa item total
-    console.log("Shipping Cost:", ongkir); // Log untuk memeriksa ongkir
-    console.log("Admin Fee:", biayaAdmin); // Log untuk memeriksa biaya admin
-    console.log("Calculated Gross Amount:", calculatedGrossAmount); // Log untuk memeriksa gross_amount yang dihitung
+
+    // Log untuk memeriksa semua perhitungan
+    console.log("Item Total:", itemTotal);
+    console.log("Shipping Cost:", ongkir);
+    console.log("Admin Fee:", biayaAdmin);
+    console.log("Calculated Gross Amount:", calculatedGrossAmount);
 
     // Log untuk memeriksa nilai yang dikirim ke Midtrans API
     const grossAmount = order.total || 0;
@@ -132,7 +134,7 @@ module.exports = async (req, res) => {
     };
 
     // Log untuk parameter yang dikirim ke Midtrans
-    console.log("Midtrans API Request Parameter:", JSON.stringify(parameter, null, 2)); // Log parameter API
+    console.log("Midtrans API Request Parameter:", JSON.stringify(parameter, null, 2));
 
     try {
       const snapToken = await snap.createTransactionToken(parameter);
