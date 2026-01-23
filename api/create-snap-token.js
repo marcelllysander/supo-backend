@@ -92,7 +92,7 @@ module.exports = async (req, res) => {
     const parameter = {
       transaction_details: {
         order_id: orderId,
-        gross_amount: 0, // Akan dihitung berdasarkan item_details
+        gross_amount: total + ongkir + biayaAdmin, // Menambahkan ongkir dan biaya admin
       },
       item_details: [
         {

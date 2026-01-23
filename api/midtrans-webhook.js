@@ -184,7 +184,7 @@ module.exports = async (req, res) => {
       }
 
       // Menambahkan ongkir dan biaya admin ke gross_amount
-      const finalGrossAmount = total + ongkir + biayaAdmin;
+      const finalGrossAmount = Number(grossAmount) + Number(order.ongkir || 0) + 2000; // 2000 adalah biaya admin
 
       // Update total pembayaran di order
       t.set(
