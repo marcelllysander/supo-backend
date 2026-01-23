@@ -40,8 +40,10 @@ module.exports = async (req, res) => {
     const authHeader = req.headers.authorization || "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
     if (!token) return json(res, 401, { error: "Missing auth token" });
+    console.log("Received Token:", token);
 
     const decoded = await admin.auth().verifyIdToken(token);
+    console.log("Decoded UID:", decoded.uid);
     const uid = decoded.uid;
 
     // 2) Ambil orderId dari body
@@ -51,15 +53,17 @@ module.exports = async (req, res) => {
 
     // 3) Ambil order dari Firestore
     const orderRef = db.collection("orders").doc(orderId);
+    console.log("Fetching Order with ID:", orderId);
     const snapOrder = await orderRef.get();
     if (!snapOrder.exists) return json(res, 404, { error: "Order not found" });
 
     const order = snapOrder.data() || {};
+    console.log("Fetched Order:", JSON.stringify(order, null, 2));
+
     if (order.buyerUid !== uid) return json(res, 403, { error: "Not your order" });
 
     const currentStatus = String(order.status || "PENDING_PAYMENT");
 
-    // Kalau sudah final, jangan pernah ditimpa lagi
     if (currentStatus === "PAID") {
       return json(res, 409, { error: "Order already PAID" });
     }
@@ -82,10 +86,11 @@ module.exports = async (req, res) => {
       itemTotal += item.price * item.quantity; // Harga * Quantity
     });
 
-    const ongkir = Number(order.shipping || 0); // Ongkir dari order
-    const biayaAdmin = Number(order.adminFee || 0); // Biaya admin dari order
+    const ongkir = Number(order.shipping || 0);
+    const biayaAdmin = Number(order.adminFee || 0);
 
-    const grossAmount = itemTotal + ongkir + biayaAdmin; // Pastikan ini dihitung dengan benar
+    const grossAmount = itemTotal + ongkir + biayaAdmin;
+    console.log("Final Gross Amount:", grossAmount);
 
     // 5) Midtrans Snap
     const isProduction = String(process.env.MIDTRANS_IS_PRODUCTION) === "true";
@@ -102,7 +107,7 @@ module.exports = async (req, res) => {
     const parameter = {
       transaction_details: {
         order_id: orderId,
-        gross_amount: grossAmount, // Menggunakan grossAmount yang sudah dihitung
+        gross_amount: grossAmount,
       },
       item_details: item_details,
       customer_details: {
@@ -117,11 +122,12 @@ module.exports = async (req, res) => {
       enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"],
     };
 
-    console.log("Gross Amount (Total):", grossAmount); // Log untuk verifikasi
+    console.log("Midtrans API Request Parameter:", JSON.stringify(parameter, null, 2));
 
     try {
       const snapToken = await snap.createTransactionToken(parameter);
-      // Simpan snap token ke Firestore
+      console.log("Snap Token Created:", snapToken);
+
       await orderRef.set(
         {
           payment: {
@@ -140,6 +146,7 @@ module.exports = async (req, res) => {
   } catch (e) {
     console.error("ERROR FULL:", e);
     const detail = e?.ApiResponse?.error_messages || e?.message || String(e);
+    console.log("Error Details:", detail);
     return json(res, 500, { error: "Server error", detail });
   }
 };
