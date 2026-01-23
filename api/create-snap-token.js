@@ -104,7 +104,7 @@ module.exports = async (req, res) => {
       clientKey: clientKey,
     });
 
-    // Pastikan calculatedGrossAmount digunakan di parameter berikut
+    // Gunakan calculatedGrossAmount di sini untuk memastikan kesesuaian
     const parameter = {
       transaction_details: {
         order_id: orderId,
