@@ -82,17 +82,13 @@ module.exports = async (req, res) => {
       itemTotal += item.price * item.quantity; // Harga * Quantity
     });
 
-    const ongkir = Number(order.shipping || 0); // Ongkir dari order
-    const biayaAdmin = Number(order.adminFee || 0); // Biaya admin dari order
+    // Menghitung gross_amount hanya berdasarkan item details
+    console.log("Item Total from Item Details:", itemTotal);
+    console.log("Shipping Cost:", order.shipping || 0);
+    console.log("Admin Fee:", order.adminFee || 0);
 
-    // Menghitung total gross_amount
-    const calculatedGrossAmount = itemTotal + ongkir + biayaAdmin; // Pastikan ini dihitung dengan benar
-    console.log("Item Total:", itemTotal);
-    console.log("Shipping Cost:", ongkir);
-    console.log("Admin Fee:", biayaAdmin);
-    console.log("Calculated Gross Amount:", calculatedGrossAmount);
-    console.log("Item Details:", JSON.stringify(item_details, null, 2));
-    console.log("Gross Amount Sent to Midtrans:", calculatedGrossAmount);
+    // Kirimkan gross_amount yang hanya berdasarkan item details
+    const calculatedGrossAmount = itemTotal;
 
     // Cek apakah hasil perhitungan benar
     if (isNaN(calculatedGrossAmount)) {
@@ -114,7 +110,7 @@ module.exports = async (req, res) => {
     const parameter = {
       transaction_details: {
         order_id: orderId,
-        gross_amount: calculatedGrossAmount, // Menggunakan grossAmount yang sudah dihitung
+        gross_amount: calculatedGrossAmount, // Menggunakan grossAmount yang hanya berdasarkan item details
       },
       item_details: item_details,
       customer_details: {
@@ -129,27 +125,21 @@ module.exports = async (req, res) => {
       enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"],
     };
 
-    // Log untuk parameter yang dikirim ke Midtrans
     console.log("Midtrans API Request Parameter:", JSON.stringify(parameter, null, 2));
 
-    try {
-      const snapToken = await snap.createTransactionToken(parameter);
-      // Simpan snap token ke Firestore
-      await orderRef.set(
-        {
-          payment: {
-            provider: "MIDTRANS",
-            snapToken,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
+    const snapToken = await snap.createTransactionToken(parameter);
+    // Simpan snap token ke Firestore
+    await orderRef.set(
+      {
+        payment: {
+          provider: "MIDTRANS",
+          snapToken,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
         },
-        { merge: true },
-      );
-      return json(res, 200, { snapToken });
-    } catch (err) {
-      console.error("Error creating snap token:", err);
-      return json(res, 500, { error: "Failed to create snap token", detail: err.message });
-    }
+      },
+      { merge: true },
+    );
+    return json(res, 200, { snapToken });
   } catch (e) {
     console.error("ERROR FULL:", e);
     const detail = e?.ApiResponse?.error_messages || e?.message || String(e);
