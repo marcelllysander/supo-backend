@@ -85,23 +85,12 @@ module.exports = async (req, res) => {
     const ongkir = Number(order.shipping || 0); // Ongkir dari order
     const biayaAdmin = Number(order.adminFee || 0); // Biaya admin dari order
 
+    // Menghitung total gross_amount
     const calculatedGrossAmount = itemTotal + ongkir + biayaAdmin; // Pastikan ini dihitung dengan benar
-
-    // Log untuk memeriksa semua perhitungan
     console.log("Item Total:", itemTotal);
     console.log("Shipping Cost:", ongkir);
     console.log("Admin Fee:", biayaAdmin);
     console.log("Calculated Gross Amount:", calculatedGrossAmount);
-
-    // Log untuk memeriksa nilai yang dikirim ke Midtrans API
-    const grossAmount = order.total || 0;
-    console.log("Gross Amount Sent to Midtrans:", grossAmount);
-
-    // Cek jika gross_amount yang dihitung tidak sesuai dengan yang dikirimkan
-    if (calculatedGrossAmount !== grossAmount) {
-      console.error("Mismatch in Gross Amount:", calculatedGrossAmount, grossAmount);
-      return json(res, 400, { error: "Mismatch between gross_amount and item details" });
-    }
 
     // 5) Midtrans Snap
     const isProduction = String(process.env.MIDTRANS_IS_PRODUCTION) === "true";
@@ -115,6 +104,7 @@ module.exports = async (req, res) => {
       clientKey: clientKey,
     });
 
+    // Pastikan calculatedGrossAmount digunakan di parameter berikut
     const parameter = {
       transaction_details: {
         order_id: orderId,
