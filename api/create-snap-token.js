@@ -83,11 +83,12 @@ module.exports = async (req, res) => {
     if (!serverKey || !clientKey) return json(res, 500, { error: "Midtrans env missing" });
 
     const snap = new midtransClient.Snap({
-      isProduction,
-      serverKey,
-      clientKey,
+      isProduction: isProduction, // Pastikan sudah benar
+      serverKey: serverKey,
+      clientKey: clientKey,
     });
 
+    // Parameter untuk Midtrans
     const parameter = {
       transaction_details: {
         order_id: orderId,
@@ -95,10 +96,10 @@ module.exports = async (req, res) => {
       },
       item_details: [
         {
-          id: order.productId || "item",
-          price: Number(order.price || total),
-          quantity: Number(order.quantity || 1),
-          name: String(order.productName || "Produk").slice(0, 50),
+          id: order.productId || "item", // Pastikan ada fallback untuk id
+          price: Number(order.price || total), // Fallback ke total jika price kosong
+          quantity: Number(order.quantity || 1), // Fallback ke 1 jika quantity kosong
+          name: String(order.productName || "Produk").slice(0, 50), // Fallback ke "Produk"
         },
       ],
       customer_details: {
@@ -110,29 +111,31 @@ module.exports = async (req, res) => {
           address: String(order.address || "").slice(0, 200),
         },
       },
-      enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"],
+      enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"], // Pastikan metode pembayaran aktif
     };
 
-    const snapToken = await snap.createTransactionToken(parameter);
-
-    // 5) Simpan ke Firestore
-    await orderRef.set(
-      {
-        payment: {
-          provider: "MIDTRANS",
-          snapToken,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    // Mengirim permintaan ke Midtrans untuk membuat Snap Token
+    try {
+      const snapToken = await snap.createTransactionToken(parameter);
+      // Simpan snap token ke Firestore
+      await orderRef.set(
+        {
+          payment: {
+            provider: "MIDTRANS",
+            snapToken,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
         },
-      },
-      { merge: true }
-    );
-
-    return json(res, 200, { snapToken });
+        { merge: true },
+      );
+      return json(res, 200, { snapToken });
+    } catch (err) {
+      console.error("Error creating snap token:", err);
+      return json(res, 500, { error: "Failed to create snap token", detail: err.message });
+    }
   } catch (e) {
     console.error("ERROR FULL:", e);
-
     const detail = e?.ApiResponse?.error_messages || e?.message || String(e);
-
     return json(res, 500, { error: "Server error", detail });
   }
 };
