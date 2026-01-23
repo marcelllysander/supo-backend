@@ -75,7 +75,7 @@ module.exports = async (req, res) => {
 
     const total = Number(order.total || 0);
     const ongkir = Number(order.shipping || 0); // Ongkir sudah ada di Firestore
-    const biayaAdmin = 2000; // Misalnya biaya admin tetap, bisa disesuaikan
+    const biayaAdmin = 2000; // Biaya admin
 
     if (total <= 0) return json(res, 400, { error: "Invalid total" });
 
@@ -107,11 +107,14 @@ module.exports = async (req, res) => {
       itemTotal += item.price * item.quantity; // Harga * Quantity
     });
 
+    // Pastikan gross_amount dihitung dengan benar
+    const grossAmount = itemTotal + ongkir + biayaAdmin;
+
     // Parameter untuk Midtrans
     const parameter = {
       transaction_details: {
         order_id: orderId,
-        gross_amount: itemTotal + ongkir + biayaAdmin, // Menambahkan ongkir dan biaya admin
+        gross_amount: grossAmount, // Menggunakan grossAmount yang sudah dihitung
       },
       item_details: item_details,
       customer_details: {
@@ -127,7 +130,7 @@ module.exports = async (req, res) => {
     };
 
     // Pastikan gross_amount dihitung dengan benar
-    console.log("Gross Amount (Total):", itemTotal + ongkir + biayaAdmin); // Log untuk verifikasi
+    console.log("Gross Amount (Total):", grossAmount); // Log untuk verifikasi
 
     // Mengirim permintaan ke Midtrans untuk membuat Snap Token
     try {
