@@ -82,20 +82,15 @@ module.exports = async (req, res) => {
       itemTotal += item.price * item.quantity; // Harga * Quantity
     });
 
-    // Menghitung gross_amount hanya berdasarkan item details
+    // Menghitung gross_amount berdasarkan item details dan menambahkan ongkir & biaya admin
+    const ongkir = Number(order.shipping || 0); // Ongkir dari order
+    const biayaAdmin = Number(order.adminFee || 0); // Biaya admin dari order
+
+    const calculatedGrossAmount = itemTotal + ongkir + biayaAdmin; // Menambahkan ongkir dan biaya admin
     console.log("Item Total from Item Details:", itemTotal);
-    console.log("Shipping Cost:", order.shipping || 0);
-    console.log("Admin Fee:", order.adminFee || 0);
-    console.log("Item Total (Sum of item details):", itemTotal); // Total harga barang saja
-    console.log("Gross Amount without Shipping/Admin:", itemTotal); // Pastikan ini sesuai
-
-    // Kirimkan gross_amount yang hanya berdasarkan item details
-    const calculatedGrossAmount = itemTotal;
-    console.log("Gross Amount Sent to Midtrans (Without Shipping/Admin):", calculatedGrossAmount);
-
-    console.log("Item Total:", itemTotal);
     console.log("Shipping Cost:", ongkir);
     console.log("Admin Fee:", biayaAdmin);
+    console.log("Calculated Gross Amount:", calculatedGrossAmount); // Log perhitungan gross_amount
 
     // Cek apakah hasil perhitungan benar
     if (isNaN(calculatedGrossAmount)) {
@@ -117,7 +112,7 @@ module.exports = async (req, res) => {
     const parameter = {
       transaction_details: {
         order_id: orderId,
-        gross_amount: calculatedGrossAmount, // Menggunakan grossAmount yang hanya berdasarkan item details
+        gross_amount: calculatedGrossAmount, // Menggunakan grossAmount yang sudah dihitung
       },
       item_details: item_details,
       customer_details: {
