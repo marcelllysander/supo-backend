@@ -67,7 +67,25 @@ module.exports = async (req, res) => {
       return res.status(400).json({ ok: false, message: "OTP salah." });
     }
 
-    const user = await authAdmin.getUserByEmail(emailLower);
+    function isUserNotFoundError(e) {
+      const code = e?.code || "";
+      return code === "auth/user-not-found" || code === "USER_NOT_FOUND";
+    }
+
+    // ...
+
+    let user;
+    try {
+      user = await authAdmin.getUserByEmail(emailLower);
+    } catch (e) {
+      if (isUserNotFoundError(e)) {
+        // optional: bersihkan OTP kalau ada
+        await ref.delete().catch(() => {});
+        return res.status(404).json({ ok: false, message: "Email tidak terdaftar." });
+      }
+      throw e;
+    }
+
     await authAdmin.updateUser(user.uid, { password: newPassword });
 
     // paksa login ulang (recommended)

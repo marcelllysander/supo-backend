@@ -1,4 +1,4 @@
-const { dbAdmin } = require("../../lib/firebaseAdmin");
+const { authAdmin, dbAdmin } = require("../../lib/firebaseAdmin");
 const { sendOtpEmail } = require("../../lib/mailer");
 const { normalizeEmail, isValidEmail, emailDocId, genOtp6, otpHash } = require("../../lib/otpUtil");
 
@@ -14,6 +14,11 @@ async function parseBody(req) {
   return {};
 }
 
+function isUserNotFoundError(e) {
+  const code = e?.code || "";
+  return code === "auth/user-not-found" || code === "USER_NOT_FOUND";
+}
+
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, message: "Method not allowed" });
@@ -25,6 +30,16 @@ module.exports = async (req, res) => {
 
     if (!isValidEmail(emailLower)) {
       return res.status(400).json({ ok: false, message: "Email tidak valid." });
+    }
+
+    // ✅ CEK: email harus terdaftar di Firebase Auth
+    try {
+      await authAdmin.getUserByEmail(emailLower);
+    } catch (e) {
+      if (isUserNotFoundError(e)) {
+        return res.status(404).json({ ok: false, message: "Email tidak terdaftar." });
+      }
+      throw e; // error lain (mis config firebase)
     }
 
     const docId = emailDocId(emailLower);
