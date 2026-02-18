@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "firebase-admin": "^12.5.0",
-    "midtrans-client": "^1.4.2"
+    "midtrans-client": "^1.4.2",
+    "nodemailer": "^6.9.15"
   }
 }
