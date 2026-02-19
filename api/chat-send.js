@@ -70,7 +70,7 @@ module.exports = async (req, res) => {
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         },
-        { merge: true }
+        { merge: true },
       );
 
       t.set(msgRef, {
@@ -91,14 +91,30 @@ module.exports = async (req, res) => {
 
       const message = {
         tokens,
-        data: {
-          type: "chat",
-          chatId,
+
+        // ✅ ini bikin Android bisa tampilkan notif otomatis saat background
+        notification: {
           title: notifTitle,
           body: notifBody,
         },
+
+        // ✅ data untuk routing buka chat yang benar
+        data: {
+          type: "chat",
+          chatId,
+          senderUid, // penting untuk open chat ke lawan chat
+          receiverUid,
+          title: notifTitle,
+          body: notifBody,
+        },
+
         android: {
           priority: "high",
+          notification: {
+            channelId: "chat", // harus sama dengan channel di Android
+            sound: "default",
+            tag: chatId,
+          },
         },
       };
 
