@@ -17,7 +17,9 @@ async function parseBody(req) {
 }
 
 module.exports = async (req, res) => {
-  if (req.method !== "POST") return res.status(405).json({ ok: false, message: "Method not allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, message: "Method not allowed" });
+  }
 
   try {
     const decoded = await requireAuth(req);
@@ -34,26 +36,33 @@ module.exports = async (req, res) => {
       return res.status(400).json({ ok: false, message: "channel tidak valid" });
     }
 
-    // Ambil kontak lama dari companies/{uid}
-    const cSnap = await dbAdmin.collection("companies").doc(uid).get();
-    if (!cSnap.exists) return res.status(404).json({ ok: false, message: "Company tidak ditemukan" });
+    // 1) Ambil profil: companies/{uid} -> fallback suppliers/{uid}
+    let profileSnap = await dbAdmin.collection("companies").doc(uid).get();
+    if (!profileSnap.exists) {
+      profileSnap = await dbAdmin.collection("suppliers").doc(uid).get();
+    }
+    if (!profileSnap.exists) {
+      return res.status(404).json({ ok: false, message: "Data tidak ditemukan (companies/suppliers)." });
+    }
 
-    const oldEmail = cSnap.get("companyEmail");
-    const oldPhone = cSnap.get("companyPhone");
+    const oldEmail = profileSnap.get("companyEmail");
+    const oldPhone = profileSnap.get("companyPhone");
 
-    // rate limit per uid+action
+    // 2) rate limit per uid+action
     const docId = Buffer.from(`${uid}:${action}`).toString("base64url");
     const ref = dbAdmin.collection("company_change_otps").doc(docId);
-    const snap = await ref.get();
+
+    const otpSnap = await ref.get();
     const now = Date.now();
 
-    if (snap.exists) {
-      const nextAllowedAt = snap.get("nextAllowedAt");
+    if (otpSnap.exists) {
+      const nextAllowedAt = otpSnap.get("nextAllowedAt");
       if (nextAllowedAt && now < nextAllowedAt) {
         return res.status(429).json({ ok: false, message: "Tunggu sebentar sebelum minta OTP lagi." });
       }
     }
 
+    // 3) simpan OTP
     const otp = genOtp6();
     await ref.set({
       uid,
@@ -66,11 +75,15 @@ module.exports = async (req, res) => {
       channel,
     });
 
+    // 4) kirim OTP
     if (channel === "email") {
       if (!oldEmail) return res.status(400).json({ ok: false, message: "Email lama belum ada." });
       await sendOtpEmail(oldEmail, otp);
     } else {
       if (!oldPhone) return res.status(400).json({ ok: false, message: "Nomor HP lama belum ada." });
+      if (!String(oldPhone).startsWith("+")) {
+        return res.status(400).json({ ok: false, message: "Nomor HP lama harus format +62xxxx" });
+      }
       await sendOtpWhatsapp(oldPhone, otp);
     }
 
