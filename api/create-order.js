@@ -127,12 +127,14 @@ module.exports = async (req, res) => {
       // Nanti kalau mau, bisa ganti ke nama dari users/{buyerUid}
       const buyerName = receiverName;
       const orderCode = makeOrderCode(orderRef.id);
+      const buyerCancelableUntilAt = admin.firestore.Timestamp.fromMillis(Date.now() + 15 * 60 * 1000);
 
       const orderData = {
         buyerUid,
         sellerUid,
         productId,
         orderCode,
+        buyerCancelableUntilAt,
 
         // ===== Nama untuk history/detail (kompatibel dengan app) =====
         buyerName, // dipakai TransactionHistoryModel
