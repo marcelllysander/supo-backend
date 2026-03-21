@@ -31,7 +31,6 @@ module.exports = async (req, res) => {
     initFirebase();
     const db = admin.firestore();
 
-    // 1) Verify Firebase ID token
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
     if (!idToken) {
@@ -41,10 +40,13 @@ module.exports = async (req, res) => {
     const decoded = await admin.auth().verifyIdToken(idToken);
     const senderUid = decoded.uid;
 
-    // 2) Parse body safely
     let body = req.body;
     if (typeof body === "string") {
-      body = body.trim() ? JSON.parse(body) : {};
+      try {
+        body = body.trim() ? JSON.parse(body) : {};
+      } catch {
+        return json(res, 400, { error: "Invalid JSON body" });
+      }
     }
     body = body || {};
 
@@ -115,66 +117,112 @@ module.exports = async (req, res) => {
     const chatRef = db.collection("chats").doc(chatId);
     const msgRef = chatRef.collection("messages").doc();
 
-    await db.runTransaction(async (t) => {
-      const chatSnap = await t.get(chatRef);
-      const chatExists = chatSnap.exists;
+    try {
+      await db.runTransaction(async (t) => {
+        const chatSnap = await t.get(chatRef);
+        const chatExists = chatSnap.exists;
 
-      const chatData = {
-        participants: { [senderUid]: true, [receiverUid]: true },
-        participantIds: [senderUid, receiverUid],
+        if (chatExists) {
+          const existingParticipantIds = chatSnap.get("participantIds") || [];
+          if (
+            !Array.isArray(existingParticipantIds) ||
+            !existingParticipantIds.includes(senderUid) ||
+            !existingParticipantIds.includes(receiverUid)
+          ) {
+            const err = new Error("Not allowed");
+            err.code = "forbidden";
+            throw err;
+          }
+        }
 
-        lastMessage: text,
-        lastSenderId: senderUid,
-        lastMessageAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        const oldParticipants = chatSnap.get("participants") || {};
+        const oldParticipantIds = chatSnap.get("participantIds") || [];
 
-        [`unreadCountByUid.${receiverUid}`]: admin.firestore.FieldValue.increment(1),
-        [`unreadCountByUid.${senderUid}`]: 0,
-        [`lastReadAtByUid.${senderUid}`]: admin.firestore.FieldValue.serverTimestamp(),
-      };
+        const chatData = {
+          participants: {
+            ...oldParticipants,
+            [senderUid]: true,
+            [receiverUid]: true,
+          },
+          participantIds:
+            Array.isArray(oldParticipantIds) && oldParticipantIds.length > 0
+              ? oldParticipantIds
+              : [senderUid, receiverUid],
 
-      // hanya set createdAt kalau chat baru
-      if (!chatExists) {
-        chatData.createdAt = admin.firestore.FieldValue.serverTimestamp();
-      }
+          lastMessage: text,
+          lastSenderId: senderUid,
+          lastMessageAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
 
-      // jangan timpa title lama dengan string kosong
-      if (chatTitleForSender) {
-        chatData.title = chatTitleForSender;
-      }
+          [`unreadCountByUid.${receiverUid}`]: admin.firestore.FieldValue.increment(1),
+          [`unreadCountByUid.${senderUid}`]: 0,
+          [`lastReadAtByUid.${senderUid}`]: admin.firestore.FieldValue.serverTimestamp(),
+        };
 
-      t.set(chatRef, chatData, { merge: true });
+        if (!chatExists) {
+          chatData.createdAt = admin.firestore.FieldValue.serverTimestamp();
+        }
 
-      t.set(msgRef, {
-        senderId: senderUid,
-        text,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        replyToMessageId,
-        replyToText,
-        replyToSenderId,
+        if (chatTitleForSender) {
+          chatData.title = chatTitleForSender;
+        }
+
+        t.set(chatRef, chatData, { merge: true });
+
+        t.set(msgRef, {
+          senderId: senderUid,
+          text,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          replyToMessageId,
+          replyToText,
+          replyToSenderId,
+        });
       });
-    });
+    } catch (e) {
+      if (e?.code === "forbidden") {
+        return json(res, 403, { error: "Not allowed" });
+      }
+      throw e;
+    }
 
-    // 3) Ambil token milik receiver
-    const receiverTokenSnap = await db
-      .collection("users")
+    const notifSettingsSnap = await db
+      .collection("notification_settings")
       .doc(receiverUid)
-      .collection("fcmTokens")
+      .get();
+
+    const notifSettings = notifSettingsSnap.exists ? notifSettingsSnap.data() : {};
+
+    const pushEnabled = notifSettings.pushEnabled !== false;
+    const chatEnabled = notifSettings.chatEnabled !== false;
+
+    if (!pushEnabled || !chatEnabled) {
+      return json(res, 200, {
+        ok: true,
+        action: "send",
+        messageId: msgRef.id,
+        chatId,
+        notificationSkipped: true,
+        reason: "disabled_by_user"
+      });
+    }
+
+    const receiverTokenSnap = await db
+      .collection("notification_tokens")
+      .doc(receiverUid)
+      .collection("tokens")
       .get();
 
     let tokens = receiverTokenSnap.docs.map((d) => d.id).filter(Boolean);
 
-    // hardening: buang token milik sender kalau tersimpan ganda / salah user
     const senderTokenSnap = await db
-      .collection("users")
+      .collection("notification_tokens")
       .doc(senderUid)
-      .collection("fcmTokens")
+      .collection("tokens")
       .get();
 
     const senderTokens = new Set(senderTokenSnap.docs.map((d) => d.id).filter(Boolean));
-    tokens = tokens.filter((tk) => !senderTokens.has(tk));
+    tokens = [...new Set(tokens)].filter((tk) => !senderTokens.has(tk));
 
-    // 4) Kirim data-only FCM
     if (tokens.length > 0) {
       const notifTitle = senderName || "Pesan baru";
       const notifBody = text.length > 120 ? text.slice(0, 120) + "..." : text;
@@ -188,11 +236,9 @@ module.exports = async (req, res) => {
           receiverUid,
           senderName: notifTitle,
           text: notifBody,
-
           replyToMessageId,
           replyToText,
           replyToSenderId,
-
           sentAt: Date.now().toString(),
         },
         android: {
@@ -202,7 +248,6 @@ module.exports = async (req, res) => {
 
       const resp = await admin.messaging().sendEachForMulticast(message);
 
-      // 5) Bersihkan token invalid
       const badTokens = [];
       resp.responses.forEach((r, idx) => {
         if (!r.success) {
@@ -220,7 +265,7 @@ module.exports = async (req, res) => {
         const batch = db.batch();
         badTokens.forEach((tk) => {
           batch.delete(
-            db.collection("users").doc(receiverUid).collection("fcmTokens").doc(tk)
+            db.collection("notification_tokens").doc(receiverUid).collection("tokens").doc(tk)
           );
         });
         await batch.commit();
