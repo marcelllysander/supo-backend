@@ -1,4 +1,5 @@
 const { admin, authAdmin, dbAdmin } = require("../lib/firebaseAdmin");
+const midtransClient = require("midtrans-client");
 
 function json(res, code, data) {
   res.statusCode = code;
@@ -24,6 +25,20 @@ function parseJsonBody(req) {
   } catch (_) {
     throw badRequest("Body JSON tidak valid");
   }
+}
+
+function createMidtransClient() {
+  const isProduction = String(process.env.MIDTRANS_IS_PRODUCTION) === "true";
+  const serverKey = process.env.MIDTRANS_SERVER_KEY;
+  const clientKey = process.env.MIDTRANS_CLIENT_KEY;
+
+  if (!serverKey || !clientKey) return null;
+
+  return new midtransClient.Snap({
+    isProduction,
+    serverKey,
+    clientKey,
+  });
 }
 
 module.exports = async (req, res) => {
@@ -63,17 +78,15 @@ module.exports = async (req, res) => {
         throw conflict(`Order tidak bisa dibatalkan pada status ${status}`);
       }
 
-      // Aturan cancel buyer: max 15 menit
       if (isBuyer) {
         const buyerCancelableUntilAt = o.buyerCancelableUntilAt || null;
         const nowMs = Date.now();
         const limitMs = buyerCancelableUntilAt?.toMillis?.() || 0;
-        if (!limitMs || nowMs > limitMs) {
+        if (!limitMs || nowMs >= limitMs) {
           throw conflict("Batas waktu cancel pembeli sudah habis (15 menit)");
         }
       }
 
-      // release reserved stock (jika belum direlease)
       const productRef = dbAdmin.collection("products").doc(productId);
       const productSnap = await tx.get(productRef);
       if (!productSnap.exists) throw notFound("Produk tidak ditemukan");
@@ -102,8 +115,33 @@ module.exports = async (req, res) => {
         "stock.reservedReleased": true,
       });
 
-      return { ok: true };
+      return {
+        ok: true,
+        previousStatus: status,
+        shouldExpireMidtrans:
+          status === "PENDING_PAYMENT" &&
+          String(o.payment?.provider || "MIDTRANS") === "MIDTRANS" &&
+          !!String(o.payment?.snapToken || "").trim(),
+      };
     });
+
+    if (result.shouldExpireMidtrans) {
+      const apiClient = createMidtransClient();
+
+      if (apiClient) {
+        try {
+          await apiClient.transaction.expire(orderId);
+        } catch (expireErr) {
+          console.warn("Midtrans expire failed, fallback cancel:", expireErr?.message || expireErr);
+
+          try {
+            await apiClient.transaction.cancel(orderId);
+          } catch (cancelErr) {
+            console.warn("Midtrans cancel fallback failed:", cancelErr?.message || cancelErr);
+          }
+        }
+      }
+    }
 
     return json(res, 200, { ok: true, message: "Order dibatalkan" });
   } catch (e) {

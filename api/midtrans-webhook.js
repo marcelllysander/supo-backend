@@ -23,7 +23,6 @@ function json(res, code, data) {
   res.end(JSON.stringify(data));
 }
 
-// Mapping Midtrans -> status order kamu
 function mapStatus(txStatus) {
   switch (txStatus) {
     case "settlement":
@@ -33,12 +32,18 @@ function mapStatus(txStatus) {
     case "pending":
       return "PENDING_PAYMENT";
 
+    // deny sebaiknya jangan langsung ditutup,
+    // karena user masih bisa retry / bayar ulang
     case "deny":
+      return "PENDING_PAYMENT";
+
     case "cancel":
     case "expire":
+    case "failure":
       return "CANCELLED";
 
     case "refund":
+    case "partial_refund":
     case "chargeback":
       return "REFUNDED";
 
@@ -53,7 +58,6 @@ module.exports = async (req, res) => {
       return json(res, 405, { error: "Method not allowed" });
     }
 
-    // OPTIONAL: proteksi secret query
     const secret = String(req.query?.secret || "");
     if (process.env.SUPO_WEBHOOK_SECRET && secret !== process.env.SUPO_WEBHOOK_SECRET) {
       return json(res, 401, { error: "Invalid webhook secret" });
@@ -62,7 +66,7 @@ module.exports = async (req, res) => {
     initFirebase();
     const db = admin.firestore();
 
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
 
     const orderId = String(body.order_id || "");
     const statusCode = String(body.status_code || "");
@@ -72,7 +76,6 @@ module.exports = async (req, res) => {
 
     if (!orderId) return json(res, 400, { error: "Missing order_id" });
 
-    // ====== Verifikasi signature Midtrans ======
     const serverKey = process.env.MIDTRANS_SERVER_KEY || "";
     const expected = crypto
       .createHash("sha512")
@@ -84,61 +87,106 @@ module.exports = async (req, res) => {
     }
 
     const newStatus = mapStatus(transactionStatus);
+    const grossAmountNum = Number(grossAmount || 0);
 
-    // ====== TRANSACTION: update order + update stock/reserved product ======
     await db.runTransaction(async (t) => {
       const orderRef = db.collection("orders").doc(orderId);
       const orderSnap = await t.get(orderRef);
 
       if (!orderSnap.exists) {
-        // Kalau order tidak ada, tetap simpan status minimal (untuk debug)
-        t.set(orderRef, { status: newStatus }, { merge: true });
+        t.set(
+          orderRef,
+          {
+            status: newStatus,
+            totalPembayaran: Number.isFinite(grossAmountNum) ? grossAmountNum : 0,
+            payment: {
+              provider: "MIDTRANS",
+              transactionStatus,
+              paymentType: body.payment_type || null,
+              fraudStatus: body.fraud_status || null,
+              statusCode,
+              grossAmount: grossAmount,
+              rawNotification: body,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
         return;
       }
 
       const order = orderSnap.data() || {};
-      const productId = String(order.productId || "");
+      const currentStatus = String(order.status || "").trim();
+      const productId = String(order.productId || "").trim();
       const qty = Number(order.quantity || 0);
-      const ongkir = Number(order.shipping || 0); // Ongkir dari order
-      const biayaAdmin = 2000; // Biaya admin
-      const total = Number(order.total || 0); // Total produk (harga x quantity)
 
-      // 1) Update status + payment raw notification
-      t.set(
-        orderRef,
-        {
-          status: newStatus,
-          payment: {
-            provider: "MIDTRANS",
-            transactionStatus,
-            paymentType: body.payment_type || null,
-            fraudStatus: body.fraud_status || null,
-            rawNotification: body,
+      const stockMeta = order.stock || {};
+      const reservedApplied = !!stockMeta.reservedApplied;
+      const reservedReleased = !!stockMeta.reservedReleased;
+      const deducted = !!stockMeta.deducted;
+
+      const shouldReleaseReserved =
+        ["CANCELLED", "REFUNDED"].includes(newStatus) &&
+        reservedApplied &&
+        !reservedReleased &&
+        !deducted &&
+        qty > 0 &&
+        !!productId;
+
+      if (shouldReleaseReserved) {
+        const productRef = db.collection("products").doc(productId);
+        const productSnap = await t.get(productRef);
+
+        if (productSnap.exists) {
+          const product = productSnap.data() || {};
+          const reserved = Number(product.reserved || 0);
+
+          t.update(productRef, {
+            reserved: Math.max(0, reserved - qty),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-        },
-        { merge: true },
-      );
+          });
+        }
+      }
 
-      // Menambahkan ongkir dan biaya admin ke gross_amount
-      const finalGrossAmount = Number(grossAmount) + ongkir + biayaAdmin;
-      console.log("Received Webhook Data:", JSON.stringify(body, null, 2));
-      console.log("Gross Amount Received from Midtrans:", grossAmount);
-
-      // Update total pembayaran di order
-      t.set(
-        orderRef,
-        {
-          totalPembayaran: finalGrossAmount,
+      const orderUpdate = {
+        totalPembayaran: Number.isFinite(grossAmountNum) ? grossAmountNum : Number(order.total || 0),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        payment: {
+          provider: "MIDTRANS",
+          transactionStatus,
+          paymentType: body.payment_type || null,
+          fraudStatus: body.fraud_status || null,
+          statusCode,
+          grossAmount,
+          rawNotification: body,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         },
-        { merge: true },
-      );
+      };
+
+      // jangan diam-diam ubah CANCELLED -> PAID
+      if (currentStatus === "CANCELLED" && newStatus === "PAID") {
+        orderUpdate.payment.needsManualReview = true;
+        orderUpdate.payment.manualReviewReason = "Paid notification received after local cancellation";
+      } else if (currentStatus !== "DONE") {
+        orderUpdate.status = newStatus;
+
+        if (newStatus === "CANCELLED" && !order.cancelledAt) {
+          orderUpdate.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
+          orderUpdate.cancelledByRole = order.cancelledByRole || "SYSTEM";
+        }
+      }
+
+      if (shouldReleaseReserved) {
+        orderUpdate["stock.reservedReleased"] = true;
+      }
+
+      t.set(orderRef, orderUpdate, { merge: true });
     });
 
     return json(res, 200, { ok: true, status: newStatus });
   } catch (e) {
-    console.error(e);
+    console.error("midtrans-webhook error:", e);
     return json(res, 500, { error: "Server error", detail: String(e.message || e) });
   }
 };
