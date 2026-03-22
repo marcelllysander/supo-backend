@@ -28,9 +28,15 @@ function json(res, code, data) {
 }
 
 function parseBody(req) {
-  if (!req.body) return {};
-  if (typeof req.body === "string") return JSON.parse(req.body || "{}");
-  return req.body || {};
+  try {
+    if (!req.body) return {};
+    if (typeof req.body === "string") return JSON.parse(req.body || "{}");
+    return req.body || {};
+  } catch (_) {
+    const e = new Error("Body JSON tidak valid");
+    e.statusCode = 400;
+    throw e;
+  }
 }
 
 function toNum(v, fallback = 0) {
@@ -49,8 +55,7 @@ function getTimestampMs(ts) {
 }
 
 function formatMidtransStartTime(date = new Date()) {
-  // Midtrans docs contoh: YYYY-MM-DD HH:mm:ss +0700
-  const utc7Ms = date.getTime() + (7 * 60 * 60 * 1000);
+  const utc7Ms = date.getTime() + 7 * 60 * 60 * 1000;
   const d = new Date(utc7Ms);
 
   const yyyy = d.getUTCFullYear();
@@ -61,6 +66,45 @@ function formatMidtransStartTime(date = new Date()) {
   const ss = String(d.getUTCSeconds()).padStart(2, "0");
 
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} +0700`;
+}
+
+function extractReservedItems(order) {
+  const stockMeta = order?.stock || {};
+  if (Array.isArray(stockMeta.items) && stockMeta.items.length > 0) {
+    return stockMeta.items
+      .map((it) => ({
+        productId: String(it.productId || "").trim(),
+        quantity: Math.max(0, Math.floor(toNum(it.quantity, 0))),
+      }))
+      .filter((it) => it.productId && it.quantity > 0);
+  }
+
+  const productId = String(order?.productId || "").trim();
+  const quantity = Math.max(0, Math.floor(toNum(order?.quantity, 0)));
+  if (!productId || quantity <= 0) return [];
+  return [{ productId, quantity }];
+}
+
+async function releaseReservedItemsTx(tx, db, order) {
+  const stockMeta = order?.stock || {};
+  const reservedApplied = !!stockMeta.reservedApplied;
+  const reservedReleased = !!stockMeta.reservedReleased;
+  const deducted = !!stockMeta.deducted;
+
+  if (!reservedApplied || reservedReleased || deducted) return;
+
+  const items = extractReservedItems(order);
+  for (const it of items) {
+    const productRef = db.collection("products").doc(it.productId);
+    const productSnap = await tx.get(productRef);
+    if (!productSnap.exists) continue;
+
+    const reserved = toNum(productSnap.get("reserved"), 0);
+    tx.update(productRef, {
+      reserved: Math.max(0, reserved - it.quantity),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
 }
 
 async function autoCancelExpiredOrder(db, orderRef) {
@@ -83,28 +127,7 @@ async function autoCancelExpiredOrder(db, orderRef) {
       return { cancelled: false, reason: "NOT_EXPIRED_YET" };
     }
 
-    const qty = toNum(order.quantity, 0);
-    const productId = String(order.productId || "").trim();
-
-    const stockMeta = order.stock || {};
-    const reservedApplied = !!stockMeta.reservedApplied;
-    const reservedReleased = !!stockMeta.reservedReleased;
-    const deducted = !!stockMeta.deducted;
-
-    if (productId && reservedApplied && !reservedReleased && !deducted && qty > 0) {
-      const productRef = db.collection("products").doc(productId);
-      const productSnap = await tx.get(productRef);
-
-      if (productSnap.exists) {
-        const product = productSnap.data() || {};
-        const reserved = toNum(product.reserved, 0);
-
-        tx.update(productRef, {
-          reserved: Math.max(0, reserved - qty),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      }
-    }
+    await releaseReservedItemsTx(tx, db, order);
 
     tx.set(
       orderRef,
@@ -120,7 +143,75 @@ async function autoCancelExpiredOrder(db, orderRef) {
           expiredBySystemAt: admin.firestore.FieldValue.serverTimestamp(),
         },
       },
-      { merge: true },
+      { merge: true }
+    );
+
+    return { cancelled: true };
+  });
+}
+
+async function autoCancelExpiredCheckoutSession(db, checkoutRef) {
+  return db.runTransaction(async (tx) => {
+    const checkoutSnap = await tx.get(checkoutRef);
+    if (!checkoutSnap.exists) {
+      return { cancelled: false, reason: "CHECKOUT_NOT_FOUND" };
+    }
+
+    const checkout = checkoutSnap.data() || {};
+    const status = String(checkout.status || "").trim();
+    const limitMs = getTimestampMs(checkout.buyerCancelableUntilAt);
+    const nowMs = Date.now();
+
+    if (status !== "PENDING_PAYMENT") {
+      return { cancelled: false, reason: "STATUS_CHANGED", status };
+    }
+
+    if (!limitMs || nowMs < limitMs) {
+      return { cancelled: false, reason: "NOT_EXPIRED_YET" };
+    }
+
+    const orderIds = Array.isArray(checkout.orderIds) ? checkout.orderIds : [];
+
+    for (const id of orderIds) {
+      const orderRef = db.collection("orders").doc(String(id));
+      const orderSnap = await tx.get(orderRef);
+      if (!orderSnap.exists) continue;
+
+      const order = orderSnap.data() || {};
+      await releaseReservedItemsTx(tx, db, order);
+
+      tx.set(
+        orderRef,
+        {
+          status: "CANCELLED",
+          cancelledByUid: "",
+          cancelledByRole: "SYSTEM",
+          cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          "stock.reservedReleased": true,
+          payment: {
+            provider: "MIDTRANS",
+            expiredBySystemAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+        },
+        { merge: true }
+      );
+    }
+
+    tx.set(
+      checkoutRef,
+      {
+        status: "CANCELLED",
+        cancelledByUid: "",
+        cancelledByRole: "SYSTEM",
+        cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        payment: {
+          provider: "MIDTRANS",
+          expiredBySystemAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      },
+      { merge: true }
     );
 
     return { cancelled: true };
@@ -145,17 +236,31 @@ module.exports = async (req, res) => {
 
     const body = parseBody(req);
     const orderId = String(body?.orderId || "").trim();
-    if (!orderId) return json(res, 400, { error: "orderId required" });
+    const checkoutId = String(body?.checkoutId || "").trim();
 
-    const orderRef = db.collection("orders").doc(orderId);
-    const orderSnap = await orderRef.get();
-    if (!orderSnap.exists) return json(res, 404, { error: "Order not found" });
+    if (!orderId && !checkoutId) {
+      return json(res, 400, { error: "orderId or checkoutId required" });
+    }
 
-    const order = orderSnap.data() || {};
-    if (order.buyerUid !== uid) return json(res, 403, { error: "Not your order" });
+    const isCheckoutMode = checkoutId !== "";
+    const targetRef = isCheckoutMode
+      ? db.collection("checkout_sessions").doc(checkoutId)
+      : db.collection("orders").doc(orderId);
 
-    const currentStatus = String(order.status || "PENDING_PAYMENT").trim();
-    const limitMs = getTimestampMs(order.buyerCancelableUntilAt);
+    const targetSnap = await targetRef.get();
+    if (!targetSnap.exists) {
+      return json(res, 404, {
+        error: isCheckoutMode ? "Checkout not found" : "Order not found",
+      });
+    }
+
+    const target = targetSnap.data() || {};
+    if (target.buyerUid !== uid) {
+      return json(res, 403, { error: "Not your checkout/order" });
+    }
+
+    const currentStatus = String(target.status || "PENDING_PAYMENT").trim();
+    const limitMs = getTimestampMs(target.buyerCancelableUntilAt);
     const nowMs = Date.now();
 
     if (currentStatus === "PAID") {
@@ -171,13 +276,17 @@ module.exports = async (req, res) => {
     }
 
     if (nowMs >= limitMs) {
-      await autoCancelExpiredOrder(db, orderRef);
+      if (isCheckoutMode) {
+        await autoCancelExpiredCheckoutSession(db, targetRef);
+      } else {
+        await autoCancelExpiredOrder(db, targetRef);
+      }
       return json(res, 409, { error: "Payment time limit exceeded" });
     }
 
-    const existingSnapToken = String(order.payment?.snapToken || "").trim();
+    const existingSnapToken = String(target.payment?.snapToken || "").trim();
     const existingRedirectUrl = String(
-      order.payment?.redirectUrl || order.payment?.snapRedirectUrl || "",
+      target.payment?.redirectUrl || target.payment?.snapRedirectUrl || ""
     ).trim();
 
     if (currentStatus === "PENDING_PAYMENT" && existingSnapToken) {
@@ -188,34 +297,71 @@ module.exports = async (req, res) => {
       });
     }
 
-    const productPrice = toNum(order.productPrice, toNum(order.price, 0));
-    const shippingFee = toNum(order.shippingFee, toNum(order.shipping, 0));
-    const adminFee = toNum(order.adminFee, 0);
-    const quantity = Math.max(1, Math.floor(toNum(order.quantity, 1)));
+    let itemDetails = [];
+    let grossAmount = 0;
 
-    const itemDetails = [
-      {
-        id: order.productId || "item",
-        price: productPrice,
-        quantity,
-        name: String(order.productName || "Produk").slice(0, 50),
-      },
-      {
-        id: "shipping",
-        price: shippingFee,
-        quantity: 1,
-        name: "Shipping Cost",
-      },
-      {
-        id: "admin_fee",
-        price: adminFee,
-        quantity: 1,
-        name: "Admin Fee",
-      },
-    ];
+    if (isCheckoutMode) {
+      itemDetails = [
+        ...(Array.isArray(target.items) ? target.items : []).map((it) => ({
+          id: it.productId || "item",
+          price: toNum(it.productPrice, 0),
+          quantity: Math.max(1, Math.floor(toNum(it.quantity, 1))),
+          name: String(it.productName || "Produk").slice(0, 50),
+        })),
+        ...(Array.isArray(target.stores) ? target.stores : []).flatMap((store) => {
+          const arr = [];
 
-    const grossAmount = itemDetails.reduce((sum, item) => {
-      return sum + (toNum(item.price, 0) * toNum(item.quantity, 0));
+          if (toNum(store.shippingFee, 0) > 0) {
+            arr.push({
+              id: `shipping_${store.sellerUid || "store"}`,
+              price: toNum(store.shippingFee, 0),
+              quantity: 1,
+              name: `Ongkir ${String(store.sellerName || "Toko").slice(0, 40)}`.slice(0, 50),
+            });
+          }
+
+          if (toNum(store.adminFee, 0) > 0) {
+            arr.push({
+              id: `admin_${store.sellerUid || "store"}`,
+              price: toNum(store.adminFee, 0),
+              quantity: 1,
+              name: `Admin ${String(store.sellerName || "Toko").slice(0, 41)}`.slice(0, 50),
+            });
+          }
+
+          return arr;
+        }),
+      ];
+    } else {
+      const productPrice = toNum(target.productPrice, toNum(target.price, 0));
+      const shippingFee = toNum(target.shippingFee, toNum(target.shipping, 0));
+      const adminFee = toNum(target.adminFee, 0);
+      const quantity = Math.max(1, Math.floor(toNum(target.quantity, 1)));
+
+      itemDetails = [
+        {
+          id: target.productId || "item",
+          price: productPrice,
+          quantity,
+          name: String(target.productName || "Produk").slice(0, 50),
+        },
+        {
+          id: "shipping",
+          price: shippingFee,
+          quantity: 1,
+          name: "Shipping Cost",
+        },
+        {
+          id: "admin_fee",
+          price: adminFee,
+          quantity: 1,
+          name: "Admin Fee",
+        },
+      ];
+    }
+
+    grossAmount = itemDetails.reduce((sum, item) => {
+      return sum + toNum(item.price, 0) * toNum(item.quantity, 0);
     }, 0);
 
     if (!Number.isFinite(grossAmount) || grossAmount <= 0) {
@@ -237,19 +383,23 @@ module.exports = async (req, res) => {
 
     const remainingMinutes = Math.max(1, Math.ceil((limitMs - nowMs) / 60000));
 
+    const customerName = String(target.receiverName || target.buyerName || "Customer").slice(0, 50);
+    const customerPhone = String(target.receiverPhone || "");
+    const customerAddress = String(target.address || "").slice(0, 200);
+
     const parameter = {
       transaction_details: {
-        order_id: orderId,
+        order_id: isCheckoutMode ? checkoutId : orderId,
         gross_amount: grossAmount,
       },
       item_details: itemDetails,
       customer_details: {
-        first_name: String(order.receiverName || order.buyerName || "Customer").slice(0, 50),
-        phone: String(order.receiverPhone || ""),
+        first_name: customerName,
+        phone: customerPhone,
         shipping_address: {
-          first_name: String(order.receiverName || order.buyerName || "Customer").slice(0, 50),
-          phone: String(order.receiverPhone || ""),
-          address: String(order.address || "").slice(0, 200),
+          first_name: customerName,
+          phone: customerPhone,
+          address: customerAddress,
         },
       },
       enabled_payments: ["bank_transfer", "gopay", "shopeepay", "other_qris"],
@@ -269,14 +419,14 @@ module.exports = async (req, res) => {
     }
 
     const persisted = await db.runTransaction(async (tx) => {
-      const liveSnap = await tx.get(orderRef);
+      const liveSnap = await tx.get(targetRef);
       if (!liveSnap.exists) throw new Error("Order not found during save");
 
-      const liveOrder = liveSnap.data() || {};
-      const liveStatus = String(liveOrder.status || "").trim();
-      const liveLimitMs = getTimestampMs(liveOrder.buyerCancelableUntilAt);
+      const liveTarget = liveSnap.data() || {};
+      const liveStatus = String(liveTarget.status || "").trim();
+      const liveLimitMs = getTimestampMs(liveTarget.buyerCancelableUntilAt);
 
-      if (liveOrder.buyerUid !== uid) {
+      if (liveTarget.buyerUid !== uid) {
         throw new Error("Not your order");
       }
 
@@ -293,9 +443,9 @@ module.exports = async (req, res) => {
         };
       }
 
-      const alreadySavedToken = String(liveOrder.payment?.snapToken || "").trim();
+      const alreadySavedToken = String(liveTarget.payment?.snapToken || "").trim();
       const alreadySavedRedirectUrl = String(
-        liveOrder.payment?.redirectUrl || liveOrder.payment?.snapRedirectUrl || "",
+        liveTarget.payment?.redirectUrl || liveTarget.payment?.snapRedirectUrl || ""
       ).trim();
 
       if (alreadySavedToken) {
@@ -307,7 +457,7 @@ module.exports = async (req, res) => {
       }
 
       tx.set(
-        orderRef,
+        targetRef,
         {
           payment: {
             provider: "MIDTRANS",
@@ -319,7 +469,7 @@ module.exports = async (req, res) => {
           },
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         },
-        { merge: true },
+        { merge: true }
       );
 
       return {
@@ -334,7 +484,11 @@ module.exports = async (req, res) => {
     }
 
     if (persisted?.expired) {
-      await autoCancelExpiredOrder(db, orderRef);
+      if (isCheckoutMode) {
+        await autoCancelExpiredCheckoutSession(db, targetRef);
+      } else {
+        await autoCancelExpiredOrder(db, targetRef);
+      }
       return json(res, 409, { error: "Payment time limit exceeded" });
     }
 
@@ -342,6 +496,7 @@ module.exports = async (req, res) => {
   } catch (e) {
     console.error("ERROR FULL:", e);
     const detail = e?.ApiResponse?.error_messages || e?.message || String(e);
-    return json(res, 500, { error: "Server error", detail });
+    const code = Number(e.statusCode) || 500;
+    return json(res, code, { error: code >= 500 ? "Server error" : "Request failed", detail });
   }
 };

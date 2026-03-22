@@ -12,6 +12,7 @@ function httpError(statusCode, message) {
   e.statusCode = statusCode;
   return e;
 }
+
 const badRequest = (m) => httpError(400, m);
 const forbidden = (m) => httpError(403, m);
 const conflict = (m) => httpError(409, m);
@@ -41,6 +42,45 @@ function createMidtransClient() {
   });
 }
 
+function extractReservedItems(order) {
+  const stockMeta = order?.stock || {};
+  if (Array.isArray(stockMeta.items) && stockMeta.items.length > 0) {
+    return stockMeta.items
+      .map((it) => ({
+        productId: String(it.productId || "").trim(),
+        quantity: Number(it.quantity || 0),
+      }))
+      .filter((it) => it.productId && it.quantity > 0);
+  }
+
+  const productId = String(order?.productId || "").trim();
+  const quantity = Number(order?.quantity || 0);
+  if (!productId || quantity <= 0) return [];
+  return [{ productId, quantity }];
+}
+
+async function releaseReservedItemsTx(tx, order) {
+  const stockMeta = order?.stock || {};
+  const reservedApplied = !!stockMeta.reservedApplied;
+  const reservedReleased = !!stockMeta.reservedReleased;
+  const deducted = !!stockMeta.deducted;
+
+  if (!reservedApplied || reservedReleased || deducted) return;
+
+  const items = extractReservedItems(order);
+  for (const it of items) {
+    const productRef = dbAdmin.collection("products").doc(it.productId);
+    const productSnap = await tx.get(productRef);
+    if (!productSnap.exists) continue;
+
+    const reserved = Number(productSnap.get("reserved") || 0);
+    tx.update(productRef, {
+      reserved: Math.max(0, reserved - it.quantity),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+}
+
 module.exports = async (req, res) => {
   try {
     if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" });
@@ -54,7 +94,89 @@ module.exports = async (req, res) => {
 
     const body = parseJsonBody(req);
     const orderId = String(body.orderId || "").trim();
-    if (!orderId) throw badRequest("orderId required");
+    const checkoutId = String(body.checkoutId || "").trim();
+
+    if (!orderId && !checkoutId) {
+      throw badRequest("orderId or checkoutId required");
+    }
+
+    if (checkoutId) {
+      const checkoutRef = dbAdmin.collection("checkout_sessions").doc(checkoutId);
+
+      const result = await dbAdmin.runTransaction(async (tx) => {
+        const checkoutSnap = await tx.get(checkoutRef);
+        if (!checkoutSnap.exists) throw notFound("Checkout tidak ditemukan");
+
+        const c = checkoutSnap.data() || {};
+        const status = String(c.status || "").trim();
+        const buyerUid = String(c.buyerUid || "").trim();
+
+        if (uid !== buyerUid) {
+          throw forbidden("Hanya pembeli yang bisa membatalkan checkout");
+        }
+
+        if (["PAID", "PROCESSING", "SHIPPING", "DONE", "CANCELLED", "REFUNDED"].includes(status)) {
+          throw conflict(`Checkout tidak bisa dibatalkan pada status ${status}`);
+        }
+
+        const buyerCancelableUntilAt = c.buyerCancelableUntilAt || null;
+        const nowMs = Date.now();
+        const limitMs = buyerCancelableUntilAt?.toMillis?.() || 0;
+        if (!limitMs || nowMs >= limitMs) {
+          throw conflict("Batas waktu cancel pembeli sudah habis (15 menit)");
+        }
+
+        const orderIds = Array.isArray(c.orderIds) ? c.orderIds : [];
+        for (const id of orderIds) {
+          const orderRef = dbAdmin.collection("orders").doc(String(id));
+          const orderSnap = await tx.get(orderRef);
+          if (!orderSnap.exists) continue;
+
+          const o = orderSnap.data() || {};
+          await releaseReservedItemsTx(tx, o);
+
+          tx.update(orderRef, {
+            status: "CANCELLED",
+            cancelledByUid: uid,
+            cancelledByRole: "BUYER",
+            cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            "stock.reservedReleased": true,
+          });
+        }
+
+        tx.update(checkoutRef, {
+          status: "CANCELLED",
+          cancelledByUid: uid,
+          cancelledByRole: "BUYER",
+          cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        return {
+          ok: true,
+          shouldExpireMidtrans:
+            status === "PENDING_PAYMENT" &&
+            String(c.payment?.provider || "MIDTRANS") === "MIDTRANS" &&
+            !!String(c.payment?.snapToken || "").trim(),
+        };
+      });
+
+      if (result.shouldExpireMidtrans) {
+        const apiClient = createMidtransClient();
+        if (apiClient) {
+          try {
+            await apiClient.transaction.expire(checkoutId);
+          } catch (expireErr) {
+            try {
+              await apiClient.transaction.cancel(checkoutId);
+            } catch (_) {}
+          }
+        }
+      }
+
+      return json(res, 200, { ok: true, message: "Checkout dibatalkan" });
+    }
 
     const orderRef = dbAdmin.collection("orders").doc(orderId);
 
@@ -66,15 +188,17 @@ module.exports = async (req, res) => {
       const status = String(o.status || "").trim();
       const buyerUid = String(o.buyerUid || "").trim();
       const sellerUid = String(o.sellerUid || "").trim();
-      const productId = String(o.productId || "").trim();
+      const checkoutSessionId = String(o.checkoutSessionId || "").trim();
 
-      if (!productId) throw badRequest("Order tidak valid (productId kosong)");
+      if (checkoutSessionId) {
+        throw conflict("Order ini bagian dari checkout gabungan. Batalkan checkout gabungannya.");
+      }
 
       const isBuyer = uid === buyerUid;
       const isSeller = uid === sellerUid;
       if (!isBuyer && !isSeller) throw forbidden("Tidak memiliki akses");
 
-      if (["PROCESSING", "SHIPPING", "DONE", "CANCELLED"].includes(status)) {
+      if (["PAID", "PROCESSING", "SHIPPING", "DONE", "CANCELLED", "REFUNDED"].includes(status)) {
         throw conflict(`Order tidak bisa dibatalkan pada status ${status}`);
       }
 
@@ -87,24 +211,7 @@ module.exports = async (req, res) => {
         }
       }
 
-      const productRef = dbAdmin.collection("products").doc(productId);
-      const productSnap = await tx.get(productRef);
-      if (!productSnap.exists) throw notFound("Produk tidak ditemukan");
-
-      const p = productSnap.data() || {};
-      const qty = Number(o.quantity || 0);
-      const reserved = Number(p.reserved || 0);
-
-      const stockMeta = o.stock || {};
-      const reservedApplied = !!stockMeta.reservedApplied;
-      const reservedReleased = !!stockMeta.reservedReleased;
-
-      if (reservedApplied && !reservedReleased && qty > 0) {
-        tx.update(productRef, {
-          reserved: Math.max(0, reserved - qty),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      }
+      await releaseReservedItemsTx(tx, o);
 
       tx.update(orderRef, {
         status: "CANCELLED",

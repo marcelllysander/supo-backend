@@ -28,28 +28,62 @@ function mapStatus(txStatus) {
     case "settlement":
     case "capture":
       return "PAID";
-
     case "pending":
       return "PENDING_PAYMENT";
-
-    // deny sebaiknya jangan langsung ditutup,
-    // karena user masih bisa retry / bayar ulang
     case "deny":
       return "PENDING_PAYMENT";
-
     case "cancel":
     case "expire":
     case "failure":
       return "CANCELLED";
-
     case "refund":
     case "partial_refund":
     case "chargeback":
       return "REFUNDED";
-
     default:
       return "PENDING_PAYMENT";
   }
+}
+
+function extractReservedItems(order) {
+  const stockMeta = order?.stock || {};
+  if (Array.isArray(stockMeta.items) && stockMeta.items.length > 0) {
+    return stockMeta.items
+      .map((it) => ({
+        productId: String(it.productId || "").trim(),
+        quantity: Number(it.quantity || 0),
+      }))
+      .filter((it) => it.productId && it.quantity > 0);
+  }
+
+  const productId = String(order?.productId || "").trim();
+  const quantity = Number(order?.quantity || 0);
+  if (!productId || quantity <= 0) return [];
+  return [{ productId, quantity }];
+}
+
+async function releaseReservedItemsTx(t, db, order) {
+  const stockMeta = order?.stock || {};
+  const reservedApplied = !!stockMeta.reservedApplied;
+  const reservedReleased = !!stockMeta.reservedReleased;
+  const deducted = !!stockMeta.deducted;
+
+  if (!reservedApplied || reservedReleased || deducted) return false;
+
+  const items = extractReservedItems(order);
+  for (const it of items) {
+    const productRef = db.collection("products").doc(it.productId);
+    const productSnap = await t.get(productRef);
+    if (!productSnap.exists) continue;
+
+    const reserved = Number(productSnap.get("reserved") || 0);
+    t.update(productRef, {
+      reserved: Math.max(0, reserved - it.quantity),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+
+  return true;
 }
 
 module.exports = async (req, res) => {
@@ -66,7 +100,7 @@ module.exports = async (req, res) => {
     initFirebase();
     const db = admin.firestore();
 
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
 
     const orderId = String(body.order_id || "");
     const statusCode = String(body.status_code || "");
@@ -88,6 +122,131 @@ module.exports = async (req, res) => {
 
     const newStatus = mapStatus(transactionStatus);
     const grossAmountNum = Number(grossAmount || 0);
+
+    const checkoutRef = db.collection("checkout_sessions").doc(orderId);
+    const checkoutSnap = await checkoutRef.get();
+
+    if (checkoutSnap.exists) {
+      const checkout = checkoutSnap.data() || {};
+
+      await db.runTransaction(async (t) => {
+        const liveCheckoutSnap = await t.get(checkoutRef);
+        const liveCheckout = liveCheckoutSnap.data() || {};
+
+        const currentCheckoutStatus = String(liveCheckout.status || "").trim();
+        const orderIds = Array.isArray(liveCheckout.orderIds) ? liveCheckout.orderIds : [];
+
+        const checkoutUpdate = {
+          totalPembayaran: Number.isFinite(grossAmountNum) ? grossAmountNum : Number(liveCheckout.total || 0),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          payment: {
+            provider: "MIDTRANS",
+            transactionStatus,
+            paymentType: body.payment_type || null,
+            fraudStatus: body.fraud_status || null,
+            statusCode,
+            grossAmount,
+            rawNotification: body,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+        };
+
+        if (currentCheckoutStatus === "CANCELLED" && newStatus === "PAID") {
+          checkoutUpdate.payment.needsManualReview = true;
+          checkoutUpdate.payment.manualReviewReason =
+            "Paid notification received after local cancellation";
+        } else if (currentCheckoutStatus !== "DONE") {
+          checkoutUpdate.status = newStatus;
+
+          if (newStatus === "CANCELLED" && !liveCheckout.cancelledAt) {
+            checkoutUpdate.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
+            checkoutUpdate.cancelledByRole = liveCheckout.cancelledByRole || "SYSTEM";
+          }
+        }
+
+        t.set(checkoutRef, checkoutUpdate, { merge: true });
+
+        for (const id of orderIds) {
+          const orderRef = db.collection("orders").doc(String(id));
+          const orderSnap = await t.get(orderRef);
+          if (!orderSnap.exists) continue;
+
+          const order = orderSnap.data() || {};
+          const currentStatus = String(order.status || "").trim();
+
+          const shouldReleaseReserved =
+            ["CANCELLED", "REFUNDED"].includes(newStatus) &&
+            !!order.stock?.reservedApplied &&
+            !order.stock?.reservedReleased &&
+            !order.stock?.deducted;
+
+          let released = false;
+          if (shouldReleaseReserved) {
+            released = await releaseReservedItemsTx(t, db, order);
+          }
+
+          const orderUpdate = {
+            totalPembayaran: Number.isFinite(grossAmountNum)
+              ? grossAmountNum
+              : Number(order.total || 0),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            payment: {
+              provider: "MIDTRANS",
+              transactionStatus,
+              paymentType: body.payment_type || null,
+              fraudStatus: body.fraud_status || null,
+              statusCode,
+              grossAmount,
+              rawNotification: body,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+          };
+
+          if (currentStatus === "CANCELLED" && newStatus === "PAID") {
+            orderUpdate.payment.needsManualReview = true;
+            orderUpdate.payment.manualReviewReason =
+              "Paid notification received after local cancellation";
+          } else if (currentStatus !== "DONE") {
+            orderUpdate.status = newStatus;
+
+            if (newStatus === "CANCELLED" && !order.cancelledAt) {
+              orderUpdate.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
+              orderUpdate.cancelledByRole = order.cancelledByRole || "SYSTEM";
+            }
+          }
+
+          if (released) {
+            orderUpdate["stock.reservedReleased"] = true;
+          }
+
+          t.set(orderRef, orderUpdate, { merge: true });
+        }
+      });
+
+      if (newStatus === "PAID") {
+        const cartItemIds = Array.isArray(checkout.cartItemIds) ? checkout.cartItemIds : [];
+        const buyerUid = String(checkout.buyerUid || "").trim();
+
+        if (buyerUid && cartItemIds.length) {
+          const batch = db.batch();
+          for (const cartItemId of cartItemIds) {
+            const cartRef = db
+              .collection("users")
+              .doc(buyerUid)
+              .collection("cart")
+              .doc(String(cartItemId));
+            batch.delete(cartRef);
+          }
+          await batch.commit();
+        }
+      }
+
+      return json(res, 200, {
+        ok: true,
+        status: newStatus,
+        mode: "CHECKOUT_SESSION",
+      });
+    }
 
     await db.runTransaction(async (t) => {
       const orderRef = db.collection("orders").doc(orderId);
@@ -111,46 +270,29 @@ module.exports = async (req, res) => {
             },
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
-          { merge: true },
+          { merge: true }
         );
         return;
       }
 
       const order = orderSnap.data() || {};
       const currentStatus = String(order.status || "").trim();
-      const productId = String(order.productId || "").trim();
-      const qty = Number(order.quantity || 0);
-
-      const stockMeta = order.stock || {};
-      const reservedApplied = !!stockMeta.reservedApplied;
-      const reservedReleased = !!stockMeta.reservedReleased;
-      const deducted = !!stockMeta.deducted;
 
       const shouldReleaseReserved =
         ["CANCELLED", "REFUNDED"].includes(newStatus) &&
-        reservedApplied &&
-        !reservedReleased &&
-        !deducted &&
-        qty > 0 &&
-        !!productId;
+        !!order.stock?.reservedApplied &&
+        !order.stock?.reservedReleased &&
+        !order.stock?.deducted;
 
+      let released = false;
       if (shouldReleaseReserved) {
-        const productRef = db.collection("products").doc(productId);
-        const productSnap = await t.get(productRef);
-
-        if (productSnap.exists) {
-          const product = productSnap.data() || {};
-          const reserved = Number(product.reserved || 0);
-
-          t.update(productRef, {
-            reserved: Math.max(0, reserved - qty),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-        }
+        released = await releaseReservedItemsTx(t, db, order);
       }
 
       const orderUpdate = {
-        totalPembayaran: Number.isFinite(grossAmountNum) ? grossAmountNum : Number(order.total || 0),
+        totalPembayaran: Number.isFinite(grossAmountNum)
+          ? grossAmountNum
+          : Number(order.total || 0),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         payment: {
           provider: "MIDTRANS",
@@ -164,10 +306,10 @@ module.exports = async (req, res) => {
         },
       };
 
-      // jangan diam-diam ubah CANCELLED -> PAID
       if (currentStatus === "CANCELLED" && newStatus === "PAID") {
         orderUpdate.payment.needsManualReview = true;
-        orderUpdate.payment.manualReviewReason = "Paid notification received after local cancellation";
+        orderUpdate.payment.manualReviewReason =
+          "Paid notification received after local cancellation";
       } else if (currentStatus !== "DONE") {
         orderUpdate.status = newStatus;
 
@@ -177,7 +319,7 @@ module.exports = async (req, res) => {
         }
       }
 
-      if (shouldReleaseReserved) {
+      if (released) {
         orderUpdate["stock.reservedReleased"] = true;
       }
 
