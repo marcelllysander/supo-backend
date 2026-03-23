@@ -59,23 +59,46 @@ function extractReservedItems(order) {
   return [{ productId, quantity }];
 }
 
-async function releaseReservedItemsTx(tx, order) {
+function shouldReleaseReserved(order) {
   const stockMeta = order?.stock || {};
-  const reservedApplied = !!stockMeta.reservedApplied;
-  const reservedReleased = !!stockMeta.reservedReleased;
-  const deducted = !!stockMeta.deducted;
+  return !!stockMeta.reservedApplied && !stockMeta.reservedReleased && !stockMeta.deducted;
+}
 
-  if (!reservedApplied || reservedReleased || deducted) return;
-
+function accumulateReleaseMap(releaseMap, order) {
   const items = extractReservedItems(order);
   for (const it of items) {
-    const productRef = dbAdmin.collection("products").doc(it.productId);
-    const productSnap = await tx.get(productRef);
-    if (!productSnap.exists) continue;
+    releaseMap.set(
+      it.productId,
+      (releaseMap.get(it.productId) || 0) + Number(it.quantity || 0)
+    );
+  }
+}
 
-    const reserved = Number(productSnap.get("reserved") || 0);
-    tx.update(productRef, {
-      reserved: Math.max(0, reserved - it.quantity),
+async function readProductStatesForReleaseTx(tx, releaseMap) {
+  const productStates = [];
+
+  for (const [productId, qtyToRelease] of releaseMap.entries()) {
+    const productRef = dbAdmin.collection("products").doc(productId);
+    const productSnap = await tx.get(productRef);
+
+    productStates.push({
+      productId,
+      productRef,
+      productSnap,
+      qtyToRelease,
+    });
+  }
+
+  return productStates;
+}
+
+function applyReleaseWrites(tx, productStates) {
+  for (const p of productStates) {
+    if (!p.productSnap.exists) continue;
+
+    const reserved = Number(p.productSnap.get("reserved") || 0);
+    tx.update(p.productRef, {
+      reserved: Math.max(0, reserved - p.qtyToRelease),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
   }
@@ -83,7 +106,9 @@ async function releaseReservedItemsTx(tx, order) {
 
 module.exports = async (req, res) => {
   try {
-    if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" });
+    if (req.method !== "POST") {
+      return json(res, 405, { error: "Method not allowed" });
+    }
 
     const authHeader = req.headers.authorization || "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
@@ -100,10 +125,14 @@ module.exports = async (req, res) => {
       throw badRequest("orderId or checkoutId required");
     }
 
+    // =========================================================
+    // CANCEL CHECKOUT SESSION
+    // =========================================================
     if (checkoutId) {
       const checkoutRef = dbAdmin.collection("checkout_sessions").doc(checkoutId);
 
       const result = await dbAdmin.runTransaction(async (tx) => {
+        // ---------- READ PHASE ----------
         const checkoutSnap = await tx.get(checkoutRef);
         if (!checkoutSnap.exists) throw notFound("Checkout tidak ditemukan");
 
@@ -127,21 +156,54 @@ module.exports = async (req, res) => {
         }
 
         const orderIds = Array.isArray(c.orderIds) ? c.orderIds : [];
-        for (const id of orderIds) {
-          const orderRef = dbAdmin.collection("orders").doc(String(id));
-          const orderSnap = await tx.get(orderRef);
-          if (!orderSnap.exists) continue;
+        const orderRefs = orderIds.map((id) => dbAdmin.collection("orders").doc(String(id)));
 
-          const o = orderSnap.data() || {};
-          await releaseReservedItemsTx(tx, o);
+        const orderSnaps = [];
+        for (const ref of orderRefs) {
+          orderSnaps.push(await tx.get(ref));
+        }
 
-          tx.update(orderRef, {
+        const orderStates = [];
+        const releaseMap = new Map();
+
+        for (let i = 0; i < orderRefs.length; i++) {
+          const orderRef = orderRefs[i];
+          const orderSnap = orderSnaps[i];
+
+          if (!orderSnap.exists) {
+            orderStates.push({ orderRef, exists: false });
+            continue;
+          }
+
+          const order = orderSnap.data() || {};
+          const release = shouldReleaseReserved(order);
+          if (release) {
+            accumulateReleaseMap(releaseMap, order);
+          }
+
+          orderStates.push({
+            orderRef,
+            exists: true,
+            order,
+            release,
+          });
+        }
+
+        const productStates = await readProductStatesForReleaseTx(tx, releaseMap);
+
+        // ---------- WRITE PHASE ----------
+        applyReleaseWrites(tx, productStates);
+
+        for (const state of orderStates) {
+          if (!state.exists) continue;
+
+          tx.update(state.orderRef, {
             status: "CANCELLED",
             cancelledByUid: uid,
             cancelledByRole: "BUYER",
             cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            "stock.reservedReleased": true,
+            "stock.reservedReleased": state.release ? true : !!state.order?.stock?.reservedReleased,
           });
         }
 
@@ -178,9 +240,13 @@ module.exports = async (req, res) => {
       return json(res, 200, { ok: true, message: "Checkout dibatalkan" });
     }
 
+    // =========================================================
+    // CANCEL SINGLE ORDER
+    // =========================================================
     const orderRef = dbAdmin.collection("orders").doc(orderId);
 
     const result = await dbAdmin.runTransaction(async (tx) => {
+      // ---------- READ PHASE ----------
       const orderSnap = await tx.get(orderRef);
       if (!orderSnap.exists) throw notFound("Order tidak ditemukan");
 
@@ -211,7 +277,16 @@ module.exports = async (req, res) => {
         }
       }
 
-      await releaseReservedItemsTx(tx, o);
+      const release = shouldReleaseReserved(o);
+      const releaseMap = new Map();
+      if (release) {
+        accumulateReleaseMap(releaseMap, o);
+      }
+
+      const productStates = await readProductStatesForReleaseTx(tx, releaseMap);
+
+      // ---------- WRITE PHASE ----------
+      applyReleaseWrites(tx, productStates);
 
       tx.update(orderRef, {
         status: "CANCELLED",
@@ -219,7 +294,7 @@ module.exports = async (req, res) => {
         cancelledByRole: isSeller ? "SELLER" : "BUYER",
         cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        "stock.reservedReleased": true,
+        "stock.reservedReleased": release ? true : !!o?.stock?.reservedReleased,
       });
 
       return {

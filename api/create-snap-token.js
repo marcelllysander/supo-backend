@@ -85,23 +85,46 @@ function extractReservedItems(order) {
   return [{ productId, quantity }];
 }
 
-async function releaseReservedItemsTx(tx, db, order) {
+function shouldReleaseReserved(order) {
   const stockMeta = order?.stock || {};
-  const reservedApplied = !!stockMeta.reservedApplied;
-  const reservedReleased = !!stockMeta.reservedReleased;
-  const deducted = !!stockMeta.deducted;
+  return !!stockMeta.reservedApplied && !stockMeta.reservedReleased && !stockMeta.deducted;
+}
 
-  if (!reservedApplied || reservedReleased || deducted) return;
-
+function accumulateReleaseMap(releaseMap, order) {
   const items = extractReservedItems(order);
   for (const it of items) {
-    const productRef = db.collection("products").doc(it.productId);
-    const productSnap = await tx.get(productRef);
-    if (!productSnap.exists) continue;
+    releaseMap.set(
+      it.productId,
+      (releaseMap.get(it.productId) || 0) + Number(it.quantity || 0)
+    );
+  }
+}
 
-    const reserved = toNum(productSnap.get("reserved"), 0);
-    tx.update(productRef, {
-      reserved: Math.max(0, reserved - it.quantity),
+async function readProductStatesForReleaseTx(tx, db, releaseMap) {
+  const productStates = [];
+
+  for (const [productId, qtyToRelease] of releaseMap.entries()) {
+    const productRef = db.collection("products").doc(productId);
+    const productSnap = await tx.get(productRef);
+
+    productStates.push({
+      productId,
+      productRef,
+      productSnap,
+      qtyToRelease,
+    });
+  }
+
+  return productStates;
+}
+
+function applyReleaseWrites(tx, productStates) {
+  for (const p of productStates) {
+    if (!p.productSnap.exists) continue;
+
+    const reserved = toNum(p.productSnap.get("reserved"), 0);
+    tx.update(p.productRef, {
+      reserved: Math.max(0, reserved - p.qtyToRelease),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
   }
@@ -109,6 +132,7 @@ async function releaseReservedItemsTx(tx, db, order) {
 
 async function autoCancelExpiredOrder(db, orderRef) {
   return db.runTransaction(async (tx) => {
+    // ---------- READ PHASE ----------
     const orderSnap = await tx.get(orderRef);
     if (!orderSnap.exists) {
       return { cancelled: false, reason: "ORDER_NOT_FOUND" };
@@ -127,7 +151,16 @@ async function autoCancelExpiredOrder(db, orderRef) {
       return { cancelled: false, reason: "NOT_EXPIRED_YET" };
     }
 
-    await releaseReservedItemsTx(tx, db, order);
+    const release = shouldReleaseReserved(order);
+    const releaseMap = new Map();
+    if (release) {
+      accumulateReleaseMap(releaseMap, order);
+    }
+
+    const productStates = await readProductStatesForReleaseTx(tx, db, releaseMap);
+
+    // ---------- WRITE PHASE ----------
+    applyReleaseWrites(tx, productStates);
 
     tx.set(
       orderRef,
@@ -137,7 +170,7 @@ async function autoCancelExpiredOrder(db, orderRef) {
         cancelledByRole: "SYSTEM",
         cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        "stock.reservedReleased": true,
+        "stock.reservedReleased": release ? true : !!order?.stock?.reservedReleased,
         payment: {
           provider: "MIDTRANS",
           expiredBySystemAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -152,6 +185,7 @@ async function autoCancelExpiredOrder(db, orderRef) {
 
 async function autoCancelExpiredCheckoutSession(db, checkoutRef) {
   return db.runTransaction(async (tx) => {
+    // ---------- READ PHASE ----------
     const checkoutSnap = await tx.get(checkoutRef);
     if (!checkoutSnap.exists) {
       return { cancelled: false, reason: "CHECKOUT_NOT_FOUND" };
@@ -171,24 +205,56 @@ async function autoCancelExpiredCheckoutSession(db, checkoutRef) {
     }
 
     const orderIds = Array.isArray(checkout.orderIds) ? checkout.orderIds : [];
+    const orderRefs = orderIds.map((id) => db.collection("orders").doc(String(id)));
 
-    for (const id of orderIds) {
-      const orderRef = db.collection("orders").doc(String(id));
-      const orderSnap = await tx.get(orderRef);
-      if (!orderSnap.exists) continue;
+    const orderSnaps = [];
+    for (const ref of orderRefs) {
+      orderSnaps.push(await tx.get(ref));
+    }
+
+    const orderStates = [];
+    const releaseMap = new Map();
+
+    for (let i = 0; i < orderRefs.length; i++) {
+      const orderRef = orderRefs[i];
+      const orderSnap = orderSnaps[i];
+
+      if (!orderSnap.exists) {
+        orderStates.push({ orderRef, exists: false });
+        continue;
+      }
 
       const order = orderSnap.data() || {};
-      await releaseReservedItemsTx(tx, db, order);
+      const release = shouldReleaseReserved(order);
+      if (release) {
+        accumulateReleaseMap(releaseMap, order);
+      }
+
+      orderStates.push({
+        orderRef,
+        exists: true,
+        order,
+        release,
+      });
+    }
+
+    const productStates = await readProductStatesForReleaseTx(tx, db, releaseMap);
+
+    // ---------- WRITE PHASE ----------
+    applyReleaseWrites(tx, productStates);
+
+    for (const state of orderStates) {
+      if (!state.exists) continue;
 
       tx.set(
-        orderRef,
+        state.orderRef,
         {
           status: "CANCELLED",
           cancelledByUid: "",
           cancelledByRole: "SYSTEM",
           cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          "stock.reservedReleased": true,
+          "stock.reservedReleased": state.release ? true : !!state.order?.stock?.reservedReleased,
           payment: {
             provider: "MIDTRANS",
             expiredBySystemAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -497,6 +563,9 @@ module.exports = async (req, res) => {
     console.error("ERROR FULL:", e);
     const detail = e?.ApiResponse?.error_messages || e?.message || String(e);
     const code = Number(e.statusCode) || 500;
-    return json(res, code, { error: code >= 500 ? "Server error" : "Request failed", detail });
+    return json(res, code, {
+      error: code >= 500 ? "Server error" : "Request failed",
+      detail,
+    });
   }
 };
