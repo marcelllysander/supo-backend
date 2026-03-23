@@ -62,28 +62,41 @@ function extractReservedItems(order) {
   return [{ productId, quantity }];
 }
 
-async function releaseReservedItemsTx(t, db, order) {
-  const stockMeta = order?.stock || {};
-  const reservedApplied = !!stockMeta.reservedApplied;
-  const reservedReleased = !!stockMeta.reservedReleased;
-  const deducted = !!stockMeta.deducted;
+function shouldReleaseReservedForStatus(order, newStatus) {
+  return (
+    ["CANCELLED", "REFUNDED"].includes(newStatus) &&
+    !!order?.stock?.reservedApplied &&
+    !order?.stock?.reservedReleased &&
+    !order?.stock?.deducted
+  );
+}
 
-  if (!reservedApplied || reservedReleased || deducted) return false;
-
+function accumulateReleaseMap(releaseMap, order) {
   const items = extractReservedItems(order);
   for (const it of items) {
-    const productRef = db.collection("products").doc(it.productId);
-    const productSnap = await t.get(productRef);
-    if (!productSnap.exists) continue;
-
-    const reserved = Number(productSnap.get("reserved") || 0);
-    t.update(productRef, {
-      reserved: Math.max(0, reserved - it.quantity),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    releaseMap.set(
+      it.productId,
+      (releaseMap.get(it.productId) || 0) + Number(it.quantity || 0)
+    );
   }
+}
 
-  return true;
+function buildPaymentUpdate(existingPayment, body, statusCode, grossAmount) {
+  return {
+    provider: "MIDTRANS",
+    snapToken: existingPayment?.snapToken || null,
+    redirectUrl: existingPayment?.redirectUrl || existingPayment?.snapRedirectUrl || null,
+    snapRedirectUrl: existingPayment?.snapRedirectUrl || existingPayment?.redirectUrl || null,
+    createdAt: existingPayment?.createdAt || null,
+
+    transactionStatus: body.transaction_status || null,
+    paymentType: body.payment_type || null,
+    fraudStatus: body.fraud_status || null,
+    statusCode,
+    grossAmount,
+    rawNotification: body,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
 }
 
 module.exports = async (req, res) => {
@@ -108,7 +121,9 @@ module.exports = async (req, res) => {
     const signatureKey = String(body.signature_key || "");
     const transactionStatus = String(body.transaction_status || "");
 
-    if (!orderId) return json(res, 400, { error: "Missing order_id" });
+    if (!orderId) {
+      return json(res, 400, { error: "Missing order_id" });
+    }
 
     const serverKey = process.env.MIDTRANS_SERVER_KEY || "";
     const expected = crypto
@@ -123,32 +138,86 @@ module.exports = async (req, res) => {
     const newStatus = mapStatus(transactionStatus);
     const grossAmountNum = Number(grossAmount || 0);
 
+    console.log("MIDTRANS WEBHOOK HIT", {
+      orderId,
+      transactionStatus,
+      mappedStatus: newStatus,
+      statusCode,
+      grossAmount,
+    });
+
     const checkoutRef = db.collection("checkout_sessions").doc(orderId);
     const checkoutSnap = await checkoutRef.get();
 
+    // =========================================================
+    // CHECKOUT SESSION MODE
+    // =========================================================
     if (checkoutSnap.exists) {
       const checkout = checkoutSnap.data() || {};
 
       await db.runTransaction(async (t) => {
+        // ---------- READ PHASE ----------
         const liveCheckoutSnap = await t.get(checkoutRef);
         const liveCheckout = liveCheckoutSnap.data() || {};
-
         const currentCheckoutStatus = String(liveCheckout.status || "").trim();
         const orderIds = Array.isArray(liveCheckout.orderIds) ? liveCheckout.orderIds : [];
 
+        const orderRefs = orderIds.map((id) => db.collection("orders").doc(String(id)));
+        const orderSnaps = [];
+        for (const ref of orderRefs) {
+          orderSnaps.push(await t.get(ref));
+        }
+
+        const releaseMap = new Map();
+        const orderStates = [];
+
+        for (let i = 0; i < orderRefs.length; i++) {
+          const orderRef = orderRefs[i];
+          const orderSnap = orderSnaps[i];
+          if (!orderSnap.exists) {
+            orderStates.push({
+              orderRef,
+              exists: false,
+            });
+            continue;
+          }
+
+          const order = orderSnap.data() || {};
+          const currentStatus = String(order.status || "").trim();
+          const shouldReleaseReserved = shouldReleaseReservedForStatus(order, newStatus);
+
+          if (shouldReleaseReserved) {
+            accumulateReleaseMap(releaseMap, order);
+          }
+
+          orderStates.push({
+            orderRef,
+            exists: true,
+            order,
+            currentStatus,
+            shouldReleaseReserved,
+          });
+        }
+
+        const productStates = [];
+        for (const [productId, qtyToRelease] of releaseMap.entries()) {
+          const productRef = db.collection("products").doc(productId);
+          const productSnap = await t.get(productRef);
+          productStates.push({
+            productId,
+            productRef,
+            productSnap,
+            qtyToRelease,
+          });
+        }
+
+        // ---------- WRITE PHASE ----------
         const checkoutUpdate = {
-          totalPembayaran: Number.isFinite(grossAmountNum) ? grossAmountNum : Number(liveCheckout.total || 0),
+          totalPembayaran: Number.isFinite(grossAmountNum)
+            ? grossAmountNum
+            : Number(liveCheckout.total || 0),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          payment: {
-            provider: "MIDTRANS",
-            transactionStatus,
-            paymentType: body.payment_type || null,
-            fraudStatus: body.fraud_status || null,
-            statusCode,
-            grossAmount,
-            rawNotification: body,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
+          payment: buildPaymentUpdate(liveCheckout.payment, body, statusCode, grossAmount),
         };
 
         if (currentCheckoutStatus === "CANCELLED" && newStatus === "PAID") {
@@ -166,40 +235,28 @@ module.exports = async (req, res) => {
 
         t.set(checkoutRef, checkoutUpdate, { merge: true });
 
-        for (const id of orderIds) {
-          const orderRef = db.collection("orders").doc(String(id));
-          const orderSnap = await t.get(orderRef);
-          if (!orderSnap.exists) continue;
+        for (const p of productStates) {
+          if (!p.productSnap.exists) continue;
+          const reserved = Number(p.productSnap.get("reserved") || 0);
 
-          const order = orderSnap.data() || {};
-          const currentStatus = String(order.status || "").trim();
+          t.update(p.productRef, {
+            reserved: Math.max(0, reserved - p.qtyToRelease),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
 
-          const shouldReleaseReserved =
-            ["CANCELLED", "REFUNDED"].includes(newStatus) &&
-            !!order.stock?.reservedApplied &&
-            !order.stock?.reservedReleased &&
-            !order.stock?.deducted;
+        for (const state of orderStates) {
+          if (!state.exists) continue;
 
-          let released = false;
-          if (shouldReleaseReserved) {
-            released = await releaseReservedItemsTx(t, db, order);
-          }
+          const order = state.order;
+          const currentStatus = state.currentStatus;
 
           const orderUpdate = {
             totalPembayaran: Number.isFinite(grossAmountNum)
               ? grossAmountNum
               : Number(order.total || 0),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            payment: {
-              provider: "MIDTRANS",
-              transactionStatus,
-              paymentType: body.payment_type || null,
-              fraudStatus: body.fraud_status || null,
-              statusCode,
-              grossAmount,
-              rawNotification: body,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
+            payment: buildPaymentUpdate(order.payment, body, statusCode, grossAmount),
           };
 
           if (currentStatus === "CANCELLED" && newStatus === "PAID") {
@@ -215,11 +272,11 @@ module.exports = async (req, res) => {
             }
           }
 
-          if (released) {
+          if (state.shouldReleaseReserved) {
             orderUpdate["stock.reservedReleased"] = true;
           }
 
-          t.set(orderRef, orderUpdate, { merge: true });
+          t.set(state.orderRef, orderUpdate, { merge: true });
         }
       });
 
@@ -248,7 +305,11 @@ module.exports = async (req, res) => {
       });
     }
 
+    // =========================================================
+    // SINGLE ORDER MODE
+    // =========================================================
     await db.runTransaction(async (t) => {
+      // ---------- READ PHASE ----------
       const orderRef = db.collection("orders").doc(orderId);
       const orderSnap = await t.get(orderRef);
 
@@ -258,16 +319,7 @@ module.exports = async (req, res) => {
           {
             status: newStatus,
             totalPembayaran: Number.isFinite(grossAmountNum) ? grossAmountNum : 0,
-            payment: {
-              provider: "MIDTRANS",
-              transactionStatus,
-              paymentType: body.payment_type || null,
-              fraudStatus: body.fraud_status || null,
-              statusCode,
-              grossAmount: grossAmount,
-              rawNotification: body,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
+            payment: buildPaymentUpdate({}, body, statusCode, grossAmount),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
           { merge: true }
@@ -277,16 +329,34 @@ module.exports = async (req, res) => {
 
       const order = orderSnap.data() || {};
       const currentStatus = String(order.status || "").trim();
+      const shouldReleaseReserved = shouldReleaseReservedForStatus(order, newStatus);
 
-      const shouldReleaseReserved =
-        ["CANCELLED", "REFUNDED"].includes(newStatus) &&
-        !!order.stock?.reservedApplied &&
-        !order.stock?.reservedReleased &&
-        !order.stock?.deducted;
-
-      let released = false;
+      const releaseMap = new Map();
       if (shouldReleaseReserved) {
-        released = await releaseReservedItemsTx(t, db, order);
+        accumulateReleaseMap(releaseMap, order);
+      }
+
+      const productStates = [];
+      for (const [productId, qtyToRelease] of releaseMap.entries()) {
+        const productRef = db.collection("products").doc(productId);
+        const productSnap = await t.get(productRef);
+        productStates.push({
+          productId,
+          productRef,
+          productSnap,
+          qtyToRelease,
+        });
+      }
+
+      // ---------- WRITE PHASE ----------
+      for (const p of productStates) {
+        if (!p.productSnap.exists) continue;
+        const reserved = Number(p.productSnap.get("reserved") || 0);
+
+        t.update(p.productRef, {
+          reserved: Math.max(0, reserved - p.qtyToRelease),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
       }
 
       const orderUpdate = {
@@ -294,16 +364,7 @@ module.exports = async (req, res) => {
           ? grossAmountNum
           : Number(order.total || 0),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        payment: {
-          provider: "MIDTRANS",
-          transactionStatus,
-          paymentType: body.payment_type || null,
-          fraudStatus: body.fraud_status || null,
-          statusCode,
-          grossAmount,
-          rawNotification: body,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
+        payment: buildPaymentUpdate(order.payment, body, statusCode, grossAmount),
       };
 
       if (currentStatus === "CANCELLED" && newStatus === "PAID") {
@@ -319,7 +380,7 @@ module.exports = async (req, res) => {
         }
       }
 
-      if (released) {
+      if (shouldReleaseReserved) {
         orderUpdate["stock.reservedReleased"] = true;
       }
 
