@@ -136,11 +136,16 @@ async function handleCartCheckout({ body, buyerUid, res }) {
         Array.isArray(p.images) && typeof p.images[0] === "string" ? p.images[0] : "";
       const sellerName = String(p.companyName || "").trim();
       const location = String(p.location || "").trim();
+      const unitLabel = String(p.unitLabel || "").trim() || "pcs";
+      const minOrder = Math.max(1, Math.floor(toNum(p.minOrder, 1)));
 
       if (!sellerUid) throw badRequest("Produk tidak valid (sellerUid kosong).");
       if (buyerUid === sellerUid) throw badRequest("Tidak bisa membeli produk sendiri.");
       if (productStatus !== "PUBLISHED") {
         throw conflict(`Produk ${productName || reqItem.productId} belum dipublish.`);
+      }
+      if (reqItem.quantity < minOrder) {
+        throw badRequest(`Minimal order untuk ${productName || reqItem.productId} adalah ${minOrder} ${unitLabel}.`);
       }
       if (reqItem.quantity > available) {
         throw conflict(`Stok tidak cukup untuk ${productName}. Tersedia: ${available}`);
@@ -400,10 +405,15 @@ module.exports = async (req, res) => {
         Array.isArray(p.images) && typeof p.images[0] === "string" ? p.images[0] : "";
       const sellerCompanyName = String(p.companyName || "").trim();
       const location = String(p.location || "").trim();
+      const unitLabel = String(p.unitLabel || "").trim() || "pcs";
+      const minOrder = Math.max(1, Math.floor(toNum(p.minOrder, 1)));
 
       if (!sellerUid) throw badRequest("Produk tidak valid (sellerUid kosong).");
       if (buyerUid === sellerUid) throw badRequest("Tidak bisa membeli produk sendiri.");
       if (status !== "PUBLISHED") throw conflict("Produk belum dipublish.");
+      if (quantity < minOrder) {
+        throw badRequest(`Minimal order untuk ${productName || "produk ini"} adalah ${minOrder} ${unitLabel}.`);
+      } 
       if (quantity > available) throw conflict(`Stok tidak cukup. Tersedia: ${available}`);
 
       const subtotal = price * quantity;
