@@ -1,3 +1,4 @@
+// api/cron/sync-email-changes.js
 const { admin, authAdmin, dbAdmin } = require("../../lib/firebaseAdmin");
 
 module.exports = async (req, res) => {
