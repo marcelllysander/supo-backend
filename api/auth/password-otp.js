@@ -67,6 +67,10 @@ function getRegistrationRef(emailLower) {
   return dbAdmin.collection("account_registrations").doc(docId);
 }
 
+function getPhoneRegistryRef(phoneE164) {
+  return dbAdmin.collection("phone_registry").doc(phoneE164);
+}
+
 /* -------------------------------------------------------------------------- */
 /*                              PASSWORD RESET FLOW                            */
 /* -------------------------------------------------------------------------- */
@@ -491,16 +495,24 @@ async function handleSignupVerify(req, res, body) {
 
 async function handleSignupComplete(req, res, body) {
   const emailLower = normalizeEmail(body.email);
-  const idToken = String(body.idToken || "").trim();
+  const password = String(body.password || "");
+  const confirmPassword = String(body.confirmPassword || "");
 
   if (!isValidEmail(emailLower)) {
     return res.status(400).json({ ok: false, message: "Email tidak valid." });
   }
 
-  if (!idToken) {
+  if (password !== confirmPassword) {
     return res.status(400).json({
       ok: false,
-      message: "idToken wajib dikirim.",
+      message: "Konfirmasi password tidak sama.",
+    });
+  }
+
+  if (!isPasswordStrong(password)) {
+    return res.status(400).json({
+      ok: false,
+      message: "Password tidak memenuhi syarat keamanan.",
     });
   }
 
@@ -526,138 +538,131 @@ async function handleSignupComplete(req, res, body) {
     });
   }
 
-  let decoded;
-  try {
-    decoded = await authAdmin.verifyIdToken(idToken, true);
-  } catch (e) {
-    return res.status(401).json({
-      ok: false,
-      message: "Token Firebase tidak valid.",
-    });
-  }
-
-  const uid = decoded.uid;
-
-  let authUser;
-  try {
-    authUser = await authAdmin.getUser(uid);
-  } catch (e) {
-    return res.status(404).json({
-      ok: false,
-      message: "User Firebase tidak ditemukan.",
-    });
-  }
-
-  const authEmail = normalizeEmail(authUser.email || "");
-  const authPhone = normalizePhoneE164(authUser.phoneNumber || "");
-
-  if (authEmail !== emailLower) {
-    return res.status(400).json({
-      ok: false,
-      message: "Email Firebase tidak sesuai dengan data registrasi.",
-    });
-  }
-
-  if (authPhone !== phoneE164) {
-    return res.status(400).json({
-      ok: false,
-      message: "Nomor HP Firebase tidak sesuai dengan data registrasi.",
-    });
-  }
-
   const existingEmailUser = await getUserByEmailOrNull(emailLower);
-  if (existingEmailUser && existingEmailUser.uid !== uid) {
+  if (existingEmailUser) {
     return res.status(409).json({
       ok: false,
       message: "Email sudah terdaftar. Silakan login.",
     });
   }
 
-  const existingPhoneUser = await getUserByPhoneOrNull(phoneE164);
-  if (existingPhoneUser && existingPhoneUser.uid !== uid) {
+  const phoneRegistryRef = getPhoneRegistryRef(phoneE164);
+  const phoneRegistrySnap = await phoneRegistryRef.get();
+  if (phoneRegistrySnap.exists) {
     return res.status(409).json({
       ok: false,
-      message: "Nomor HP sudah terdaftar. Gunakan nomor lain.",
+      message: "Nomor HP sudah digunakan. Gunakan nomor lain.",
     });
   }
 
-  await authAdmin.updateUser(uid, {
-    displayName: fullName || undefined,
-    emailVerified: true,
-  });
+  let createdUser = null;
 
-  const username = `supo_${uid.slice(0, 6).toLowerCase()}`;
+  try {
+    createdUser = await authAdmin.createUser({
+      email: emailLower,
+      emailVerified: true,
+      password,
+      displayName: fullName || undefined,
+      disabled: false,
+    });
 
-  const userData = {
-    uid,
+    const uid = createdUser.uid
+    const username = `supo_${uid.slice(0, 6).toLowerCase()}`;
 
-    firstName,
-    lastName,
-    fullName,
-    displayName: fullName,
-
-    email: emailLower,
-    phone: phoneE164,
-    phoneE164,
-
-    emailVerified: true,
-    phoneVerified: true,
-
-    username,
-    usernameChanged: false,
-
-    photoUrl: "",
-    photoPath: "",
-
-    companyName: "",
-
-    role: "",
-    verificationType: "",
-    verificationStatus: "NOT_VERIFIED",
-    canCheckout: false,
-
-    createdAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
-  };
-
-  const userRef = dbAdmin.collection("users").doc(uid);
-  const usernameRef = dbAdmin.collection("usernames").doc(username);
-  const publicProfileRef = dbAdmin.collection("publicProfiles").doc(uid);
-
-  const batch = dbAdmin.batch();
-
-  batch.set(userRef, userData, { merge: true });
-
-  batch.set(
-    usernameRef,
-    {
+    const userData = {
       uid,
-      createdAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
 
-  batch.set(
-    publicProfileRef,
-    {
+      firstName,
+      lastName,
+      fullName,
       displayName: fullName,
+
+      email: emailLower,
+
+      // nomor HP tetap disimpan, tapi belum diverifikasi
+      phone: phoneE164,
+      phoneE164,
+      phoneVerified: false,
+      phoneVerifiedVia: "",
+
+      telegramUserId: "",
+      telegramUsername: "",
+      telegramVerifiedAt: null,
+
+      emailVerified: true,
+
       username,
+      usernameChanged: false,
+
       photoUrl: "",
+      photoPath: "",
+
+      companyName: "",
+
       role: "",
+      verificationType: "",
       verificationStatus: "NOT_VERIFIED",
-    },
-    { merge: true }
-  );
+      canCheckout: false,
 
-  await batch.commit();
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    };
 
-  await ref.delete().catch(() => {});
+    const userRef = dbAdmin.collection("users").doc(uid);
+    const usernameRef = dbAdmin.collection("usernames").doc(username);
+    const publicProfileRef = dbAdmin.collection("publicProfiles").doc(uid);
 
-  return res.status(200).json({
-    ok: true,
-    message: "Registrasi berhasil. Silakan lanjut menggunakan aplikasi.",
-    uid,
-  });
+    const batch = dbAdmin.batch();
+
+    batch.set(userRef, userData, { merge: true });
+
+    batch.set(
+      usernameRef,
+      {
+        uid,
+        createdAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    batch.set(
+      publicProfileRef,
+      {
+        displayName: fullName,
+        username,
+        photoUrl: "",
+        role: "",
+        verificationStatus: "NOT_VERIFIED",
+      },
+      { merge: true }
+    );
+
+    batch.set(
+      phoneRegistryRef,
+      {
+        uid,
+        phoneE164,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    await batch.commit();
+
+    await ref.delete().catch(() => {});
+
+    return res.status(200).json({
+      ok: true,
+      message: "Registrasi berhasil. Silakan login.",
+      uid,
+    });
+  } catch (e) {
+    if (createdUser?.uid) {
+      await authAdmin.deleteUser(createdUser.uid).catch(() => {});
+    }
+    throw e;
+  }
 }
 
 /* -------------------------------------------------------------------------- */
