@@ -30,6 +30,29 @@ function notFound(msg) {
   return httpError(404, msg);
 }
 
+function forbidden(msg) {
+  return httpError(403, msg);
+}
+
+async function assertBuyerCanCheckout(buyerUid) {
+  const buyerUserRef = dbAdmin.collection("users").doc(buyerUid);
+  const buyerUserSnap = await buyerUserRef.get();
+
+  if (!buyerUserSnap.exists) {
+    throw forbidden("Profil user tidak ditemukan.");
+  }
+
+  const verificationStatus = String(
+    buyerUserSnap.get("verificationStatus") || ""
+  ).trim().toUpperCase();
+
+  const canCheckout = buyerUserSnap.get("canCheckout") === true;
+
+  if (verificationStatus !== "VERIFIED" || !canCheckout) {
+    throw forbidden("Akun harus diverifikasi terlebih dahulu sebelum checkout.");
+  }
+}
+
 function parseJsonBody(req) {
   try {
     if (!req.body) return {};
@@ -349,6 +372,8 @@ module.exports = async (req, res) => {
 
     const decoded = await authAdmin.verifyIdToken(token);
     const buyerUid = decoded.uid;
+
+    await assertBuyerCanCheckout(buyerUid);
 
     const body = parseJsonBody(req);
     const mode = String(body.mode || "").trim().toUpperCase();

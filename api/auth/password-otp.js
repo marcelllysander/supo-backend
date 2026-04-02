@@ -530,24 +530,70 @@ async function handleSignupComplete(req, res, body) {
       disabled: false,
     });
 
-    // users/{uid} dibuat sederhana dulu, sesuai permintaan Anda
-    await dbAdmin.collection("users").doc(createdUser.uid).set(
+    const username = `supo_${createdUser.uid.slice(0, 6).toLowerCase()}`;
+
+    const userData = {
+      uid: createdUser.uid,
+
+      firstName,
+      lastName,
+      fullName,
+      displayName: fullName,
+
+      email: emailLower,
+      phone: phoneE164,
+      phoneE164,
+
+      emailVerified: true,
+      phoneVerified: true,
+
+      username,
+      usernameChanged: false,
+
+      photoUrl: "",
+      photoPath: "",
+
+      companyName: "",
+
+      role: "",
+      verificationType: "",
+      verificationStatus: "NOT_VERIFIED",
+      canCheckout: false,
+
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    const userRef = dbAdmin.collection("users").doc(createdUser.uid);
+    const usernameRef = dbAdmin.collection("usernames").doc(username);
+    const publicProfileRef = dbAdmin.collection("publicProfiles").doc(createdUser.uid);
+
+    const batch = dbAdmin.batch();
+
+    batch.set(userRef, userData, { merge: true });
+
+    batch.set(
+      usernameRef,
       {
         uid: createdUser.uid,
-        firstName,
-        lastName,
-        fullName,
-        email: emailLower,
-        phone: phoneE164,
-        emailVerified: true,
-        phoneVerified: true,
-        accountRole: "BUYER",
-        verificationStatus: "NOT_VERIFIED",
         createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
+
+    batch.set(
+      publicProfileRef,
+      {
+        displayName: fullName,
+        username,
+        photoUrl: "",
+        role: "",
+        verificationStatus: "NOT_VERIFIED",
+      },
+      { merge: true }
+    );
+
+    await batch.commit();
 
     await ref.delete().catch(() => {});
 
