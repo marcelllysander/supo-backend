@@ -231,12 +231,17 @@ async function handleSignupRequest(req, res, body) {
     });
   }
 
-  const existingPhoneUser = await getUserByPhoneOrNull(phoneE164);
-  if (existingPhoneUser) {
-    return res.status(409).json({
-      ok: false,
-      message: "Nomor HP sudah terdaftar. Gunakan nomor lain.",
-    });
+  // Penting:
+  // untuk purpose=email, jangan blokir hanya karena nomor HP sudah ada di Firebase Auth
+  // sebab nomor HP bisa sudah diverifikasi lebih dulu via Firebase Phone Auth di app
+  if (purpose === "phone") {
+    const existingPhoneUser = await getUserByPhoneOrNull(phoneE164);
+    if (existingPhoneUser) {
+      return res.status(409).json({
+        ok: false,
+        message: "Nomor HP sudah terdaftar. Gunakan nomor lain.",
+      });
+    }
   }
 
   if (purpose === "phone" && !["whatsapp", "sms"].includes(channel)) {
@@ -288,6 +293,7 @@ async function handleSignupRequest(req, res, body) {
     status: "PENDING",
     createdAt: snap.exists ? snap.get("createdAt") || now : now,
     updatedAt: now,
+    expireAt: admin.firestore.Timestamp.fromMillis(now + 24 * 60 * 60 * 1000),
   };
 
   const updateData = { ...baseData };
@@ -316,19 +322,52 @@ async function handleSignupRequest(req, res, body) {
 
   await ref.set(updateData, { merge: true });
 
-  if (purpose === "email") {
-    await sendOtpEmail(emailLower, otp, {
-      subject: "Kode OTP Registrasi SUPO",
-      heading: "Verifikasi Email Registrasi SUPO",
-      intro: "Masukkan kode OTP berikut untuk menyelesaikan pendaftaran akun:",
-    });
-  } else if (channel === "whatsapp") {
-    await sendOtpWhatsapp(phoneE164, otp);
-  } else {
-    await sendOtpSms(phoneE164, otp);
-  }
+  try {
+    if (purpose === "email") {
+      await sendOtpEmail(emailLower, otp, {
+        subject: "Kode OTP Registrasi SUPO",
+        heading: "Verifikasi Email Registrasi SUPO",
+        intro: "Masukkan kode OTP berikut untuk menyelesaikan pendaftaran akun:",
+      });
+    } else if (channel === "whatsapp") {
+      await sendOtpWhatsapp(phoneE164, otp);
+    } else {
+      await sendOtpSms(phoneE164, otp);
+    }
 
-  return res.status(200).json({ ok: true, message: "OTP terkirim." });
+    return res.status(200).json({ ok: true, message: "OTP terkirim." });
+  } catch (e) {
+    const rollback = {
+      updatedAt: Date.now(),
+    };
+
+    if (purpose === "email") {
+      rollback.emailOtpHash = FieldValue.delete();
+      rollback.emailOtpExpiresAt = FieldValue.delete();
+      rollback.emailOtpAttempts = FieldValue.delete();
+      rollback.emailNextAllowedAt = FieldValue.delete();
+    } else {
+      rollback.phoneOtpHash = FieldValue.delete();
+      rollback.phoneOtpExpiresAt = FieldValue.delete();
+      rollback.phoneOtpAttempts = FieldValue.delete();
+      rollback.phoneNextAllowedAt = FieldValue.delete();
+      rollback.phoneOtpChannel = FieldValue.delete();
+    }
+
+    try {
+      const latestSnap = await ref.get();
+      const hasEmailVerified = latestSnap.exists && !!latestSnap.get("emailVerifiedAt");
+      const hasPhoneVerified = latestSnap.exists && !!latestSnap.get("phoneVerifiedAt");
+
+      if (!hasEmailVerified && !hasPhoneVerified) {
+        await ref.delete();
+      } else {
+        await ref.update(rollback);
+      }
+    } catch (_) {}
+
+    throw e;
+  }
 }
 
 async function handleSignupVerify(req, res, body) {
@@ -452,24 +491,16 @@ async function handleSignupVerify(req, res, body) {
 
 async function handleSignupComplete(req, res, body) {
   const emailLower = normalizeEmail(body.email);
-  const password = String(body.password || "");
-  const confirmPassword = String(body.confirmPassword || "");
+  const idToken = String(body.idToken || "").trim();
 
   if (!isValidEmail(emailLower)) {
     return res.status(400).json({ ok: false, message: "Email tidak valid." });
   }
 
-  if (password !== confirmPassword) {
+  if (!idToken) {
     return res.status(400).json({
       ok: false,
-      message: "Konfirmasi password tidak sama.",
-    });
-  }
-
-  if (!isPasswordStrong(password)) {
-    return res.status(400).json({
-      ok: false,
-      message: "Password tidak memenuhi syarat keamanan.",
+      message: "idToken wajib dikirim.",
     });
   }
 
@@ -495,15 +526,47 @@ async function handleSignupComplete(req, res, body) {
     });
   }
 
-  if (!snap.get("phoneVerifiedAt")) {
+  let decoded;
+  try {
+    decoded = await authAdmin.verifyIdToken(idToken, true);
+  } catch (e) {
+    return res.status(401).json({
+      ok: false,
+      message: "Token Firebase tidak valid.",
+    });
+  }
+
+  const uid = decoded.uid;
+
+  let authUser;
+  try {
+    authUser = await authAdmin.getUser(uid);
+  } catch (e) {
+    return res.status(404).json({
+      ok: false,
+      message: "User Firebase tidak ditemukan.",
+    });
+  }
+
+  const authEmail = normalizeEmail(authUser.email || "");
+  const authPhone = normalizePhoneE164(authUser.phoneNumber || "");
+
+  if (authEmail !== emailLower) {
     return res.status(400).json({
       ok: false,
-      message: "Nomor HP belum diverifikasi.",
+      message: "Email Firebase tidak sesuai dengan data registrasi.",
+    });
+  }
+
+  if (authPhone !== phoneE164) {
+    return res.status(400).json({
+      ok: false,
+      message: "Nomor HP Firebase tidak sesuai dengan data registrasi.",
     });
   }
 
   const existingEmailUser = await getUserByEmailOrNull(emailLower);
-  if (existingEmailUser) {
+  if (existingEmailUser && existingEmailUser.uid !== uid) {
     return res.status(409).json({
       ok: false,
       message: "Email sudah terdaftar. Silakan login.",
@@ -511,103 +574,90 @@ async function handleSignupComplete(req, res, body) {
   }
 
   const existingPhoneUser = await getUserByPhoneOrNull(phoneE164);
-  if (existingPhoneUser) {
+  if (existingPhoneUser && existingPhoneUser.uid !== uid) {
     return res.status(409).json({
       ok: false,
       message: "Nomor HP sudah terdaftar. Gunakan nomor lain.",
     });
   }
 
-  let createdUser = null;
+  await authAdmin.updateUser(uid, {
+    displayName: fullName || undefined,
+    emailVerified: true,
+  });
 
-  try {
-    createdUser = await authAdmin.createUser({
-      email: emailLower,
-      emailVerified: true,
-      password,
-      displayName: fullName || undefined,
-      phoneNumber: phoneE164,
-      disabled: false,
-    });
+  const username = `supo_${uid.slice(0, 6).toLowerCase()}`;
 
-    const username = `supo_${createdUser.uid.slice(0, 6).toLowerCase()}`;
+  const userData = {
+    uid,
 
-    const userData = {
-      uid: createdUser.uid,
+    firstName,
+    lastName,
+    fullName,
+    displayName: fullName,
 
-      firstName,
-      lastName,
-      fullName,
-      displayName: fullName,
+    email: emailLower,
+    phone: phoneE164,
+    phoneE164,
 
-      email: emailLower,
-      phone: phoneE164,
-      phoneE164,
+    emailVerified: true,
+    phoneVerified: true,
 
-      emailVerified: true,
-      phoneVerified: true,
+    username,
+    usernameChanged: false,
 
-      username,
-      usernameChanged: false,
+    photoUrl: "",
+    photoPath: "",
 
-      photoUrl: "",
-      photoPath: "",
+    companyName: "",
 
-      companyName: "",
+    role: "",
+    verificationType: "",
+    verificationStatus: "NOT_VERIFIED",
+    canCheckout: false,
 
-      role: "",
-      verificationType: "",
-      verificationStatus: "NOT_VERIFIED",
-      canCheckout: false,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
 
+  const userRef = dbAdmin.collection("users").doc(uid);
+  const usernameRef = dbAdmin.collection("usernames").doc(username);
+  const publicProfileRef = dbAdmin.collection("publicProfiles").doc(uid);
+
+  const batch = dbAdmin.batch();
+
+  batch.set(userRef, userData, { merge: true });
+
+  batch.set(
+    usernameRef,
+    {
+      uid,
       createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    };
+    },
+    { merge: true }
+  );
 
-    const userRef = dbAdmin.collection("users").doc(createdUser.uid);
-    const usernameRef = dbAdmin.collection("usernames").doc(username);
-    const publicProfileRef = dbAdmin.collection("publicProfiles").doc(createdUser.uid);
+  batch.set(
+    publicProfileRef,
+    {
+      displayName: fullName,
+      username,
+      photoUrl: "",
+      role: "",
+      verificationStatus: "NOT_VERIFIED",
+    },
+    { merge: true }
+  );
 
-    const batch = dbAdmin.batch();
+  await batch.commit();
 
-    batch.set(userRef, userData, { merge: true });
+  await ref.delete().catch(() => {});
 
-    batch.set(
-      usernameRef,
-      {
-        uid: createdUser.uid,
-        createdAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    batch.set(
-      publicProfileRef,
-      {
-        displayName: fullName,
-        username,
-        photoUrl: "",
-        role: "",
-        verificationStatus: "NOT_VERIFIED",
-      },
-      { merge: true }
-    );
-
-    await batch.commit();
-
-    await ref.delete().catch(() => {});
-
-    return res.status(200).json({
-      ok: true,
-      message: "Registrasi berhasil. Silakan login.",
-      uid: createdUser.uid,
-    });
-  } catch (e) {
-    if (createdUser?.uid) {
-      await authAdmin.deleteUser(createdUser.uid).catch(() => {});
-    }
-    throw e;
-  }
+  return res.status(200).json({
+    ok: true,
+    message: "Registrasi berhasil. Silakan lanjut menggunakan aplikasi.",
+    uid,
+  });
 }
 
 /* -------------------------------------------------------------------------- */
