@@ -1,7 +1,7 @@
 // api/profile/otp.js
 const { dbAdmin, authAdmin } = require("../../lib/firebaseAdmin");
 const { requireAuth } = require("../../lib/authMiddleware");
-const { genOtp6, otpHash } = require("../../lib/otpUtil");
+const { genOtp6, otpHash, normalizeEmail, isValidEmail } = require("../../lib/otpUtil");
 const { sendOtpEmail } = require("../../lib/mailer");
 const { sendOtpWhatsapp } = require("../../lib/whatsapp");
 
@@ -26,17 +26,21 @@ function getStep(body) {
 async function handleRequest(req, res, decoded, body) {
   const uid = decoded.uid;
 
-  const purpose = String(body.purpose || "").trim(); // "email" | "phone"
-  const channel = String(body.channel || "").trim(); // "email" | "whatsapp"
+  const purpose = String(body.purpose || "").trim().toLowerCase();
+  const channel = String(body.channel || "").trim().toLowerCase();
 
   if (!["email", "phone"].includes(purpose)) {
     return res.status(400).json({ ok: false, message: "purpose tidak valid" });
   }
-  if (!["email", "whatsapp"].includes(channel)) {
-    return res.status(400).json({ ok: false, message: "channel tidak valid" });
+
+  if (purpose === "email" && channel !== "email") {
+    return res.status(400).json({ ok: false, message: "channel email wajib untuk verifikasi email" });
   }
 
-  // rate limit doc per uid+purpose
+  if (purpose === "phone" && channel !== "whatsapp") {
+    return res.status(400).json({ ok: false, message: "channel whatsapp wajib untuk verifikasi nomor HP" });
+  }
+
   const docId = Buffer.from(`${uid}:${purpose}`).toString("base64url");
   const ref = dbAdmin.collection("profile_verify_otps").doc(docId);
   const snap = await ref.get();
@@ -45,37 +49,53 @@ async function handleRequest(req, res, decoded, body) {
   if (snap.exists) {
     const nextAllowedAt = snap.get("nextAllowedAt");
     if (nextAllowedAt && now < nextAllowedAt) {
-      return res.status(429).json({ ok: false, message: "Tunggu sebentar sebelum minta OTP lagi." });
+      return res.status(429).json({
+        ok: false,
+        message: "Tunggu sebentar sebelum minta OTP lagi."
+      });
     }
   }
 
   const otp = genOtp6();
-  await ref.set({
-    uid,
-    purpose,
-    otpHash: otpHash(otp),
-    expiresAt: now + 10 * 60 * 1000, // 10 menit
-    attempts: 0,
-    nextAllowedAt: now + 60 * 1000, // 60 detik
-    createdAt: now,
-    channel,
-  });
 
-  // tujuan kirim OTP
-  if (channel === "email") {
-    const user = await authAdmin.getUser(uid);
-    const email = user.email;
-    if (!email) {
-      return res.status(400).json({ ok: false, message: "User tidak punya email login." });
+  let targetValue = "";
+
+  if (purpose === "email") {
+    const email = normalizeEmail(body.email);
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ ok: false, message: "Email tidak valid." });
     }
-    await sendOtpEmail(email, otp);
+    targetValue = email;
   } else {
     const userDoc = await dbAdmin.collection("users").doc(uid).get();
     const phone = userDoc.get("phone");
     if (!phone) {
       return res.status(400).json({ ok: false, message: "Nomor HP belum diisi." });
     }
-    await sendOtpWhatsapp(phone, otp);
+    targetValue = phone;
+  }
+
+  await ref.set({
+    uid,
+    purpose,
+    channel,
+    targetValue,
+    otpHash: otpHash(otp),
+    expiresAt: now + 10 * 60 * 1000,
+    attempts: 0,
+    nextAllowedAt: now + 60 * 1000,
+    createdAt: now,
+    updatedAt: now
+  });
+
+  if (purpose === "email") {
+    await sendOtpEmail(targetValue, otp, {
+      subject: "Kode OTP Verifikasi Email SUPO",
+      heading: "Verifikasi Email SUPO",
+      intro: "Masukkan kode OTP berikut untuk memverifikasi email:"
+    });
+  } else {
+    await sendOtpWhatsapp(targetValue, otp);
   }
 
   return res.status(200).json({ ok: true, message: "OTP terkirim." });
@@ -86,6 +106,7 @@ async function handleVerify(req, res, decoded, body) {
 
   const purpose = String(body.purpose || "").trim();
   const otp = String(body.otp || "").trim();
+  const email = normalizeEmail(body.email || "");
 
   if (!["email", "phone"].includes(purpose)) {
     return res.status(400).json({ ok: false, message: "purpose tidak valid" });
@@ -99,7 +120,24 @@ async function handleVerify(req, res, decoded, body) {
   const snap = await ref.get();
 
   if (!snap.exists) {
-    return res.status(400).json({ ok: false, message: "OTP tidak ditemukan / sudah kadaluarsa." });
+    return res.status(400).json({
+      ok: false,
+      message: "OTP tidak ditemukan / sudah kadaluarsa."
+    });
+  }
+
+  if (purpose === "email") {
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ ok: false, message: "Email tidak valid." });
+    }
+
+    const targetValue = String(snap.get("targetValue") || "");
+    if (targetValue !== email) {
+      return res.status(400).json({
+        ok: false,
+        message: "Email OTP tidak sesuai dengan email yang diverifikasi."
+      });
+    }
   }
 
   const now = Date.now();
@@ -113,16 +151,21 @@ async function handleVerify(req, res, decoded, body) {
 
   if (attempts >= 5) {
     await ref.delete().catch(() => {});
-    return res.status(429).json({ ok: false, message: "Terlalu banyak percobaan. Minta OTP baru." });
+    return res.status(429).json({
+      ok: false,
+      message: "Terlalu banyak percobaan. Minta OTP baru."
+    });
   }
 
   const expected = snap.get("otpHash");
   if (otpHash(otp) !== expected) {
-    await ref.update({ attempts: attempts + 1 });
+    await ref.update({
+      attempts: attempts + 1,
+      updatedAt: now
+    });
     return res.status(400).json({ ok: false, message: "OTP salah." });
   }
 
-  // sukses: hapus agar sekali pakai
   await ref.delete().catch(() => {});
 
   return res.status(200).json({ ok: true, message: "OTP valid." });
