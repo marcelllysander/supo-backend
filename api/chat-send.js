@@ -1,3 +1,4 @@
+// api/chat-send.js
 const admin = require("firebase-admin");
 
 function initFirebase() {
