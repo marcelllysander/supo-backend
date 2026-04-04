@@ -1,3 +1,4 @@
+// api/otp.js
 const handleAuthOtp = require("../lib/handlers/otp/auth-password-otp");
 const handleProfileOtp = require("../lib/handlers/otp/profile-otp");
 const handleCompanyOtp = require("../lib/handlers/otp/company-change-otp");
