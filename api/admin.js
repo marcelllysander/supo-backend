@@ -1,6 +1,7 @@
 // api/admin.js
 const { requireAuth } = require("../lib/authMiddleware");
-const handleVerificationAdmin = require("../lib/handlers/admin/verification");
+const handleAdminVerification = require("../lib/handlers/admin/verification");
+const handleAdminBroadcast = require("../lib/handlers/admin/broadcast");
 
 function parseBody(req) {
   try {
@@ -19,19 +20,16 @@ module.exports = async (req, res) => {
 
   try {
     const decoded = await requireAuth(req);
-
-    if (decoded.admin !== true) {
-      return res.status(403).json({
-        ok: false,
-        message: "Admin only"
-      });
-    }
-
     const body = parseBody(req);
+
     const moduleName = String(body.module || "").trim().toLowerCase();
 
     if (moduleName === "verification") {
-      return await handleVerificationAdmin(req, res, decoded, body);
+      return await handleAdminVerification(req, res, decoded, body);
+    }
+
+    if (moduleName === "broadcast") {
+      return await handleAdminBroadcast(req, res, decoded, body);
     }
 
     return res.status(400).json({
