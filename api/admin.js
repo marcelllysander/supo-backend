@@ -2,6 +2,7 @@
 const { requireAuth } = require("../lib/authMiddleware");
 const handleAdminVerification = require("../lib/handlers/admin/verification");
 const handleAdminBroadcast = require("../lib/handlers/admin/broadcast");
+const handleAdminUsers = require("../lib/handlers/admin/users");
 
 function parseBody(req) {
   try {
@@ -30,6 +31,10 @@ module.exports = async (req, res) => {
 
     if (moduleName === "broadcast") {
       return await handleAdminBroadcast(req, res, decoded, body);
+    }
+
+    if (moduleName === "users") {
+      return await handleAdminUsers(req, res, decoded, body);
     }
 
     return res.status(400).json({
