@@ -14,17 +14,9 @@ function parseBody(req) {
 }
 
 function str(v) {
-  return String(v || "").trim().toLowerCase();
-}
-
-function isCompanyOtp(body) {
-  const action = str(body.action);
-  return action === "change_email" || action === "change_phone";
-}
-
-function isProfileOtp(body) {
-  const purpose = str(body.purpose);
-  return purpose === "email" || purpose === "phone";
+  return String(v || "")
+    .trim()
+    .toLowerCase();
 }
 
 function isAuthOtp(body) {
@@ -36,28 +28,30 @@ function isAuthOtp(body) {
   }
 
   const hasEmail = !!String(body.email || "").trim();
-  const hasName =
-    !!String(body.firstName || "").trim() || !!String(body.lastName || "").trim();
+  const hasName = !!String(body.firstName || "").trim() || !!String(body.lastName || "").trim();
   const hasPhone = !!String(body.phone || "").trim();
   const hasPassword = !!String(body.password || "").trim();
   const hasConfirmPassword = !!String(body.confirmPassword || "").trim();
   const hasNewPassword = !!String(body.newPassword || "").trim();
   const hasOtp = !!String(body.otp || "").trim();
 
-  return (
-    !isCompanyOtp(body) &&
-    !isProfileOtp(body) &&
-    ["request", "confirm", "verify", "complete"].includes(step) &&
-    (
-      hasEmail ||
-      hasName ||
-      hasPhone ||
-      hasPassword ||
-      hasConfirmPassword ||
-      hasNewPassword ||
-      hasOtp
-    )
-  );
+  return ["request", "confirm", "verify", "complete"].includes(step) && (hasEmail || hasName || hasPhone || hasPassword || hasConfirmPassword || hasNewPassword || hasOtp);
+}
+
+function isCompanyOtp(body) {
+  const flow = str(body.flow);
+  if (flow === "signup" || flow === "password_reset") return false;
+
+  const action = str(body.action);
+  return action === "change_email" || action === "change_phone";
+}
+
+function isProfileOtp(body) {
+  const flow = str(body.flow);
+  if (flow === "signup" || flow === "password_reset") return false;
+
+  const purpose = str(body.purpose);
+  return purpose === "email" || purpose === "phone";
 }
 
 module.exports = async (req, res) => {
@@ -69,16 +63,17 @@ module.exports = async (req, res) => {
     const body = parseBody(req);
     req.body = body;
 
+    // auth/signup/password reset dulu
+    if (isAuthOtp(body)) {
+      return await handleAuthOtp(req, res);
+    }
+
     if (isCompanyOtp(body)) {
       return await handleCompanyOtp(req, res);
     }
 
     if (isProfileOtp(body)) {
       return await handleProfileOtp(req, res);
-    }
-
-    if (isAuthOtp(body)) {
-      return await handleAuthOtp(req, res);
     }
 
     return res.status(400).json({
