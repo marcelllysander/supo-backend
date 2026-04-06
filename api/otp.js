@@ -19,6 +19,23 @@ function str(v) {
     .toLowerCase();
 }
 
+function isCompanyOtp(body) {
+  const action = str(body.action);
+  return action === "change_email" || action === "change_phone";
+}
+
+function isProfileOtp(body) {
+  const purpose = str(body.purpose);
+  const flow = str(body.flow);
+
+  // signup & password_reset BUKAN profile otp
+  if (flow === "signup" || flow === "password_reset") {
+    return false;
+  }
+
+  return purpose === "email" || purpose === "phone";
+}
+
 function isAuthOtp(body) {
   const flow = str(body.flow);
   const step = str(body.step || body.mode);
@@ -35,23 +52,7 @@ function isAuthOtp(body) {
   const hasNewPassword = !!String(body.newPassword || "").trim();
   const hasOtp = !!String(body.otp || "").trim();
 
-  return ["request", "confirm", "verify", "complete"].includes(step) && (hasEmail || hasName || hasPhone || hasPassword || hasConfirmPassword || hasNewPassword || hasOtp);
-}
-
-function isCompanyOtp(body) {
-  const flow = str(body.flow);
-  if (flow === "signup" || flow === "password_reset") return false;
-
-  const action = str(body.action);
-  return action === "change_email" || action === "change_phone";
-}
-
-function isProfileOtp(body) {
-  const flow = str(body.flow);
-  if (flow === "signup" || flow === "password_reset") return false;
-
-  const purpose = str(body.purpose);
-  return purpose === "email" || purpose === "phone";
+  return !isCompanyOtp(body) && !isProfileOtp(body) && ["request", "confirm", "verify", "complete"].includes(step) && (hasEmail || hasName || hasPhone || hasPassword || hasConfirmPassword || hasNewPassword || hasOtp);
 }
 
 module.exports = async (req, res) => {
@@ -63,24 +64,33 @@ module.exports = async (req, res) => {
     const body = parseBody(req);
     req.body = body;
 
-    // auth/signup/password reset dulu
+    console.log("OTP ROUTER body:", body);
+
+    // PRIORITAS 1: auth/signup/password_reset
     if (isAuthOtp(body)) {
+      console.log("OTP ROUTER -> auth handler");
       return await handleAuthOtp(req, res);
     }
 
+    // PRIORITAS 2: company change otp
     if (isCompanyOtp(body)) {
+      console.log("OTP ROUTER -> company handler");
       return await handleCompanyOtp(req, res);
     }
 
+    // PRIORITAS 3: profile otp
     if (isProfileOtp(body)) {
+      console.log("OTP ROUTER -> profile handler");
       return await handleProfileOtp(req, res);
     }
 
+    console.log("OTP ROUTER -> unknown request");
     return res.status(400).json({
       ok: false,
       message: "Request OTP tidak dikenali",
     });
   } catch (e) {
+    console.error("OTP ROUTER ERROR:", e);
     return res.status(500).json({
       ok: false,
       message: e?.message || "Server error",
