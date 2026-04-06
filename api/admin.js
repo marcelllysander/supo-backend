@@ -16,13 +16,23 @@ function parseBody(req) {
 
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, message: "Method not allowed" });
+    return res.status(405).json({
+      ok: false,
+      message: "Method not allowed"
+    });
   }
 
   try {
     const decoded = await requireAuth(req);
-    const body = parseBody(req);
 
+    if (decoded.admin !== true) {
+      return res.status(403).json({
+        ok: false,
+        message: "Bukan admin."
+      });
+    }
+
+    const body = parseBody(req);
     const moduleName = String(body.module || "").trim().toLowerCase();
 
     if (moduleName === "verification") {
